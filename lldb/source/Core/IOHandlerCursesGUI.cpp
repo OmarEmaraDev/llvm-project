@@ -392,6 +392,12 @@ public:
   void Box(chtype v_char = ACS_VLINE, chtype h_char = ACS_HLINE) {
     ::box(m_window, v_char, h_char);
   }
+  void VerticalLine(int n, chtype v_char = ACS_VLINE) {
+    ::wvline(m_window, v_char, n);
+  }
+  void HorizontalLine(int n, chtype h_char = ACS_HLINE) {
+    ::whline(m_window, h_char, n);
+  }
   void Clear() { ::wclear(m_window); }
   void Erase() { ::werase(m_window); }
   Rect GetBounds() const {
@@ -423,12 +429,17 @@ public:
     ::wbkgd(m_window, COLOR_PAIR(color_pair_idx));
   }
 
-  void PutCStringTruncated(int right_pad, const char *s, int len = -1) {
-    int bytes_left = GetWidth() - GetCursorX();
+  void PutCStringTruncatedWidth(int right_pad, const char *s, int width,
+                                int len = -1) {
+    int bytes_left = width - GetCursorX();
     if (bytes_left > right_pad) {
       bytes_left -= right_pad;
       ::waddnstr(m_window, s, len < 0 ? bytes_left : std::min(bytes_left, len));
     }
+  }
+
+  void PutCStringTruncated(int right_pad, const char *s, int len = -1) {
+    PutCStringTruncatedWidth(right_pad, s, GetWidth(), len);
   }
 
   void MoveWindow(const Point &origin) {
@@ -674,6 +685,35 @@ public:
       AttributeOff(attr);
   }
 
+  void DrawBox(const Rect &bounds, chtype v_char = ACS_VLINE,
+               chtype h_char = ACS_HLINE) {
+    MoveCursor(bounds.origin.x, bounds.origin.y);
+    VerticalLine(bounds.size.height);
+    HorizontalLine(bounds.size.width);
+    PutChar(ACS_ULCORNER);
+
+    MoveCursor(bounds.origin.x + bounds.size.width - 1, bounds.origin.y);
+    VerticalLine(bounds.size.height);
+    PutChar(ACS_URCORNER);
+
+    MoveCursor(bounds.origin.x, bounds.origin.y + bounds.size.height - 1);
+    HorizontalLine(bounds.size.width);
+    PutChar(ACS_LLCORNER);
+
+    MoveCursor(bounds.origin.x + bounds.size.width - 1,
+               bounds.origin.y + bounds.size.height - 1);
+    PutChar(ACS_LRCORNER);
+  }
+
+  void DrawTitledBox(const Rect &bounds, const char *title,
+                     chtype v_char = ACS_VLINE, chtype h_char = ACS_HLINE) {
+    DrawBox(bounds, v_char, h_char);
+    MoveCursor(bounds.origin.x + 2, bounds.origin.y);
+    PutChar('[');
+    PutCString(title);
+    PutChar(']');
+  }
+
   virtual void Draw(bool force) {
     if (m_delegate_sp && m_delegate_sp->WindowDelegateDraw(*this, force))
       return;
@@ -867,6 +907,540 @@ protected:
 private:
   Window(const Window &) = delete;
   const Window &operator=(const Window &) = delete;
+};
+
+/////////
+// Forms
+/////////
+
+class FieldDelegate {
+public:
+  virtual ~FieldDelegate() = default;
+
+  virtual Rect FieldDelegateGetBounds() = 0;
+
+  virtual void FieldDelegateDraw(Window &window, bool is_active) = 0;
+
+  virtual HandleCharResult FieldDelegateHandleChar(int key) {
+    return eKeyNotHandled;
+  }
+};
+
+typedef std::shared_ptr<FieldDelegate> FieldDelegateSP;
+
+class TextFieldDelegate : public FieldDelegate {
+public:
+  TextFieldDelegate(const char *label, int width, Point origin,
+                    const char *content)
+      : m_label(label), m_width(width), m_origin(origin), m_content(content),
+        m_cursor_position(0), m_first_visibile_char(0) {
+    assert(m_width > 2);
+  }
+
+  // Get the bounding box of the field. The text field has a height of 3, 2
+  // lines for borders and 1 for the content.
+  Rect FieldDelegateGetBounds() override {
+    return Rect(m_origin, Size(m_width, 3));
+  }
+
+  // Get the start X position of the content in window space, without the
+  // borders.
+  int GetX() { return m_origin.x + 1; }
+
+  // Get the start Y position of the content in window space, without the
+  // borders.
+  int GetY() { return m_origin.y + 1; }
+
+  // Get the effective width of the field, without the borders.
+  int GetEffectiveWidth() { return m_width - 2; }
+
+  // Get the cursor position in window space.
+  int GetCursorWindowXPosition() {
+    return GetX() + m_cursor_position - m_first_visibile_char;
+  }
+
+  int GetContentLength() { return (int)m_content.length(); }
+
+  void FieldDelegateDraw(Window &window, bool is_active) override {
+    // Draw label box.
+    window.DrawTitledBox(FieldDelegateGetBounds(), m_label.c_str());
+
+    // Draw content.
+    window.MoveCursor(GetX(), GetY());
+    const char *text = m_content.c_str() + m_first_visibile_char;
+    window.PutCStringTruncated(0, text, GetEffectiveWidth());
+
+    // Highlight the cursor.
+    window.MoveCursor(GetCursorWindowXPosition(), GetY());
+    if (is_active)
+      window.AttributeOn(A_REVERSE);
+    if (m_cursor_position == GetContentLength())
+      // Cursor is past the last character. Highlight an empty space.
+      window.PutChar(' ');
+    else
+      window.PutChar(m_content[m_cursor_position]);
+    if (is_active)
+      window.AttributeOff(A_REVERSE);
+  }
+
+  // The cursor is allowed to move one character past the string.
+  // m_cursor_position is in range [0, GetContentLength()].
+  void MoveCursorRight() {
+    if (m_cursor_position < GetContentLength())
+      m_cursor_position++;
+  }
+
+  void MoveCursorLeft() {
+    if (m_cursor_position > 0)
+      m_cursor_position--;
+  }
+
+  // If the cursor moved past the last visible character, scroll right by one
+  // character.
+  void ScrollRightIfNeeded() {
+    if (m_cursor_position - m_first_visibile_char == GetEffectiveWidth())
+      m_first_visibile_char++;
+  }
+
+  // If the cursor moved past the first visible character, scroll left by one
+  // character.
+  void ScrollLeftIfNeeded() {
+    if (m_cursor_position < m_first_visibile_char)
+      m_first_visibile_char--;
+  }
+
+  // Insert a character at the current cursor position, advance the cursor
+  // position, and make sure to scroll right if needed.
+  void InsertChar(char character) {
+    m_content.insert(m_cursor_position, 1, character);
+    m_cursor_position++;
+    ScrollRightIfNeeded();
+  }
+
+  // Remove the character before the cursor position, retreat the cursor
+  // position, and make sure to scroll left if needed.
+  void RemoveChar() {
+    if (m_cursor_position == 0)
+      return;
+
+    m_content.erase(m_cursor_position - 1, 1);
+    m_cursor_position--;
+    ScrollLeftIfNeeded();
+  }
+
+  // True if the key represents a char that can be inserted in the field
+  // content, false otherwise.
+  virtual bool IsAcceptableChar(int key) { return isprint(key); }
+
+  HandleCharResult FieldDelegateHandleChar(int key) override {
+    if (IsAcceptableChar(key)) {
+      InsertChar((char)key);
+      return eKeyHandled;
+    }
+
+    switch (key) {
+    case KEY_RIGHT:
+      MoveCursorRight();
+      ScrollRightIfNeeded();
+      return eKeyHandled;
+    case KEY_LEFT:
+      MoveCursorLeft();
+      ScrollLeftIfNeeded();
+      return eKeyHandled;
+    case KEY_BACKSPACE:
+      RemoveChar();
+      return eKeyHandled;
+    default:
+      break;
+    }
+    return eKeyNotHandled;
+  }
+
+  // Returns the text content of the field.
+  std::string GetText() { return m_content; }
+
+protected:
+  std::string m_label;
+  // The total width of the field, including the two border characters. So the
+  // effective width is two characters less.
+  int m_width;
+  // The position of the top left corner character of the border.
+  Point m_origin;
+  std::string m_content;
+  // The cursor position in the content string itself. Can be in the range
+  // [0, GetContentLength()].
+  int m_cursor_position;
+  // The index of the first visible character in the content.
+  int m_first_visibile_char;
+};
+
+class IntegerFieldDelegate : public TextFieldDelegate {
+public:
+  IntegerFieldDelegate(const char *label, int width, Point origin, int content)
+      : TextFieldDelegate(label, width, origin,
+                          std::to_string(content).c_str()) {}
+
+  // Only accept digits.
+  bool IsAcceptableChar(int key) override { return isdigit(key); }
+
+  // Returns the integer content of the field.
+  int GetInteger() { return std::stoi(m_content); }
+};
+
+class BooleanFieldDelegate : public FieldDelegate {
+public:
+  BooleanFieldDelegate(const char *label, Point origin, bool content)
+      : m_label(label), m_origin(origin), m_content(content) {}
+
+  // Get the bounding box of the field. The boolean field is drawn as follows:
+  // [X] Label  or [ ] Label
+  // So 4 characters plus the length of the label. And only a single line.
+  Rect FieldDelegateGetBounds() override {
+    return Rect(m_origin, Size(4 + m_label.length(), 1));
+  }
+
+  // [X] Label  or [ ] Label
+  void FieldDelegateDraw(Window &window, bool is_active) override {
+    window.MoveCursor(m_origin.x, m_origin.y);
+    window.PutChar('[');
+    if (is_active)
+      window.AttributeOn(A_REVERSE);
+    window.PutChar(m_content ? 'X' : ' ');
+    if (is_active)
+      window.AttributeOff(A_REVERSE);
+    window.PutChar(']');
+    window.PutChar(' ');
+    window.PutCString(m_label.c_str());
+  }
+
+  void ToggleContent() { m_content = !m_content; }
+
+  HandleCharResult FieldDelegateHandleChar(int key) override {
+    switch (key) {
+    case ' ':
+      ToggleContent();
+      return eKeyHandled;
+    default:
+      break;
+    }
+    return eKeyNotHandled;
+  }
+
+  // Returns the boolean content of the field.
+  bool GetBoolean() { return m_content; }
+
+protected:
+  std::string m_label;
+  // The window space position of the first character.
+  Point m_origin;
+  bool m_content;
+};
+
+class ChoicesFieldDelegate : public FieldDelegate {
+public:
+  ChoicesFieldDelegate(const char *label, int width, int height, Point origin,
+                       std::vector<std::string> choices)
+      : m_label(label), m_width(width), m_height(height), m_origin(origin),
+        m_choices(choices), m_choice(0), m_first_visibile_choice(0) {
+    assert(m_width > 3);
+    assert(m_height > 2);
+  }
+
+  // Get the bounding box of the field. The height is 2 border characters with
+  // one or more space to show choices in a list.
+  Rect FieldDelegateGetBounds() override {
+    return Rect(m_origin, Size(m_width, m_height));
+  }
+
+  // Get the X position of the choices in window space, without the borders.
+  int GetX() { return m_origin.x + 1; }
+
+  // Get the Y position of the first visible choice in window space.
+  int GetY() { return m_origin.y + 1; }
+
+  // Get the effective width of the field, without the borders.
+  int GetEffectiveWidth() { return m_width - 2; }
+  //
+  // Get the effective height of the field, without the borders.
+  int GetEffectiveHeight() { return m_height - 2; }
+
+  int GetNumberOfChoices() { return m_choices.size(); }
+
+  // Get the index of the last visible choice.
+  int GetLastVisibleChoice() {
+    return std::min(m_first_visibile_choice + GetEffectiveHeight() - 1,
+                    GetNumberOfChoices() - 1);
+  }
+
+  void FieldDelegateDraw(Window &window, bool is_active) override {
+    // Draw label box.
+    window.DrawTitledBox(FieldDelegateGetBounds(), m_label.c_str());
+
+    // Draw content.
+    int choices_to_draw = GetLastVisibleChoice() - m_first_visibile_choice + 1;
+    for (int i = 0; i < choices_to_draw; i++) {
+      window.MoveCursor(GetX(), GetY() + i);
+      int current_choice = m_first_visibile_choice + i;
+      const char *text = m_choices[current_choice].c_str();
+      bool highlight = is_active && current_choice == m_choice;
+      if (highlight)
+        window.AttributeOn(A_REVERSE);
+      window.PutChar(current_choice == m_choice ? ACS_DIAMOND : ' ');
+      window.PutCString(text);
+      if (highlight)
+        window.AttributeOff(A_REVERSE);
+    }
+  }
+
+  void SelectPrevious() {
+    if (m_choice > 0)
+      m_choice--;
+  }
+
+  void SelectNext() {
+    if (m_choice < GetNumberOfChoices() - 1)
+      m_choice++;
+  }
+
+  // If the cursor moved past the first visible choice, scroll up by one
+  // choice.
+  void ScrollUpIfNeeded() {
+    if (m_choice < m_first_visibile_choice)
+      m_first_visibile_choice--;
+  }
+
+  // If the cursor moved past the last visible choice, scroll down by one
+  // choice.
+  void ScrollDownIfNeeded() {
+    if (m_choice > GetLastVisibleChoice())
+      m_first_visibile_choice++;
+  }
+
+  HandleCharResult FieldDelegateHandleChar(int key) override {
+    switch (key) {
+    case KEY_UP:
+      SelectPrevious();
+      ScrollUpIfNeeded();
+      return eKeyHandled;
+    case KEY_DOWN:
+      SelectNext();
+      ScrollDownIfNeeded();
+      return eKeyHandled;
+    default:
+      break;
+    }
+    return eKeyNotHandled;
+  }
+
+  // Returns the content of the choice as a string.
+  std::string GetChoiceContent() { return m_choices[m_choice]; }
+
+  // Returns the index of the choice.
+  int GetChoice() { return m_choice; }
+
+protected:
+  std::string m_label;
+  // The total width of the field, including the two border characters. So the
+  // effective width is two characters less.
+  int m_width;
+  // The total height of the field, including the two border characters. So the
+  // effective width is two characters less.
+  int m_height;
+  // The position of the top left corner character of the border.
+  Point m_origin;
+  std::vector<std::string> m_choices;
+  // The index of the selected choice.
+  int m_choice;
+  // The index of the first visible choice in the field.
+  int m_first_visibile_choice;
+};
+
+class Field {
+public:
+  Field(FieldDelegateSP &delegate_sp) : m_delegate_sp(delegate_sp) {}
+
+  void Draw(Window &window, bool is_active) {
+    m_delegate_sp->FieldDelegateDraw(window, is_active);
+  }
+
+  HandleCharResult HandleChar(int key) {
+    return m_delegate_sp->FieldDelegateHandleChar(key);
+  }
+
+protected:
+  FieldDelegateSP m_delegate_sp;
+};
+
+class FormDelegate {
+public:
+  FormDelegate() : m_has_error(false) {}
+
+  virtual ~FormDelegate() = default;
+
+  virtual HandleCharResult FormDelegateHandleChar(int selected_field_index,
+                                                  int key) {
+    return m_fields[selected_field_index].HandleChar(key);
+  }
+
+  virtual void FormDelegateDraw(Window &window, int selected_field_index) {
+    for (int i = 0; i < FormDelegateGetNumberOfFields(); i++) {
+      bool is_field_selected = selected_field_index == i;
+      m_fields[i].Draw(window, is_field_selected);
+    }
+  }
+
+  // Return true if submission was successful, false otherwise. If false, the
+  // method should set the m_error member to an appropriate error message.
+  virtual bool FormDelegateSubmit() = 0;
+
+  int FormDelegateGetNumberOfFields() { return m_fields.size(); }
+
+  bool HasError() { return m_has_error; }
+
+  std::string &GetError() { return m_error; }
+
+  // Factory methods to create and add fields of specific types.
+
+  TextFieldDelegate *AddTextField(const char *label, int width, Point origin,
+                                  const char *content) {
+    TextFieldDelegate *delegate =
+        new TextFieldDelegate(label, width, origin, content);
+    FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
+    m_fields.push_back(Field(delegate_sp));
+    return delegate;
+  }
+
+  IntegerFieldDelegate *AddIntegerField(const char *label, int width,
+                                        Point origin, int content) {
+    IntegerFieldDelegate *delegate =
+        new IntegerFieldDelegate(label, width, origin, content);
+    FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
+    m_fields.push_back(Field(delegate_sp));
+    return delegate;
+  }
+
+  BooleanFieldDelegate *AddBooleanField(const char *label, Point origin,
+                                        bool content) {
+    BooleanFieldDelegate *delegate =
+        new BooleanFieldDelegate(label, origin, content);
+    FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
+    m_fields.push_back(Field(delegate_sp));
+    return delegate;
+  }
+
+  ChoicesFieldDelegate *AddChoicesField(const char *label, int width,
+                                        int height, Point origin,
+                                        std::vector<std::string> choices) {
+    ChoicesFieldDelegate *delegate =
+        new ChoicesFieldDelegate(label, width, height, origin, choices);
+    FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
+    m_fields.push_back(Field(delegate_sp));
+    return delegate;
+  }
+
+protected:
+  bool m_has_error;
+  std::string m_error;
+  std::vector<Field> m_fields;
+};
+
+typedef std::shared_ptr<FormDelegate> FormDelegateSP;
+
+class FormWindowDelegate : public WindowDelegate {
+public:
+  FormWindowDelegate(FormDelegateSP &delegate_sp)
+      : m_delegate_sp(delegate_sp), m_selected_field_index(0) {}
+
+  bool WindowDelegateDraw(Window &window, bool force) override {
+    window.Erase();
+
+    window.DrawTitleBox(window.GetName(), "Press Esc to cancel");
+
+    // Draw field elements.
+    m_delegate_sp->FormDelegateDraw(window, m_selected_field_index);
+
+    // Draw a horizontal line separating the fields and the button.
+    window.MoveCursor(1, window.GetHeight() - 4);
+    window.HorizontalLine(window.GetWidth() - 2);
+
+    // Draw the centered submit button.
+    const char *button_text = "[Submit]";
+    int x = (window.GetWidth() - sizeof(button_text) - 1) / 2;
+    window.MoveCursor(x, window.GetHeight() - 3);
+    if (IsButtonActive())
+      window.AttributeOn(A_REVERSE);
+    window.PutCString(button_text);
+    if (IsButtonActive())
+      window.AttributeOff(A_REVERSE);
+
+    // Draw the error if it exists.
+    if (m_delegate_sp->HasError()) {
+      window.MoveCursor(2, window.GetHeight() - 2);
+      window.AttributeOn(COLOR_PAIR(RedOnBlack));
+      window.PutChar(ACS_DIAMOND);
+      window.PutChar(' ');
+      window.PutCStringTruncated(1, m_delegate_sp->GetError().c_str());
+      window.AttributeOff(COLOR_PAIR(RedOnBlack));
+    }
+
+    return true;
+  }
+
+  // The index can be equal to the number of fields, hence the plus one. See
+  // IsButtonActive().
+  void SelectedNextField() {
+    m_selected_field_index++;
+    int number_of_fields = m_delegate_sp->FormDelegateGetNumberOfFields();
+    m_selected_field_index %= number_of_fields + 1;
+  }
+
+  void SubmitForm(Window &window) {
+    bool is_successful = m_delegate_sp->FormDelegateSubmit();
+    if (is_successful)
+      window.GetParent()->RemoveSubWindow(&window);
+  }
+
+  HandleCharResult WindowDelegateHandleChar(Window &window, int key) override {
+    switch (key) {
+    case '\r':
+    case '\n':
+    case KEY_ENTER:
+      if (IsButtonActive()) {
+        SubmitForm(window);
+        return eKeyHandled;
+      }
+      break;
+    case '\t':
+      SelectedNextField();
+      return eKeyHandled;
+    case KEY_ESCAPE:
+      window.GetParent()->RemoveSubWindow(&window);
+      return eKeyHandled;
+    default:
+      break;
+    }
+
+    // If the key wasn't handled and one of the fields is active, pass the key
+    // to that field.
+    if (!IsButtonActive()) {
+      return m_delegate_sp->FormDelegateHandleChar(m_selected_field_index, key);
+    }
+
+    return eKeyNotHandled;
+  }
+
+  // When the selected field index is equal to the number of selected fields,
+  // this denotes that the button is selected.
+  bool IsButtonActive() {
+    int number_of_fields = m_delegate_sp->FormDelegateGetNumberOfFields();
+    return m_selected_field_index == number_of_fields;
+  }
+
+protected:
+  FormDelegateSP m_delegate_sp;
+  // The index of the selected field. This can be equal to the number of fields,
+  // in which case, it denotes that the button is selected.
+  int m_selected_field_index;
 };
 
 class MenuDelegate {
