@@ -1000,6 +1000,11 @@ public:
       m_first_visibile_char++;
   }
 
+  void ScrollLeft() {
+    if (m_first_visibile_char > 0)
+      m_first_visibile_char--;
+  }
+
   // If the cursor moved past the first visible character, scroll left by one
   // character.
   void ScrollLeftIfNeeded() {
@@ -1023,7 +1028,7 @@ public:
 
     m_content.erase(m_cursor_position - 1, 1);
     m_cursor_position--;
-    ScrollLeftIfNeeded();
+    ScrollLeft();
   }
 
   // True if the key represents a char that can be inserted in the field
