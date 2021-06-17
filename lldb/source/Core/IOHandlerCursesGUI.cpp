@@ -429,17 +429,12 @@ public:
     ::wbkgd(m_window, COLOR_PAIR(color_pair_idx));
   }
 
-  void PutCStringTruncatedWidth(int right_pad, const char *s, int width,
-                                int len = -1) {
-    int bytes_left = width - GetCursorX();
+  void PutCStringTruncated(int right_pad, const char *s, int len = -1) {
+    int bytes_left = GetWidth() - GetCursorX();
     if (bytes_left > right_pad) {
       bytes_left -= right_pad;
       ::waddnstr(m_window, s, len < 0 ? bytes_left : std::min(bytes_left, len));
     }
-  }
-
-  void PutCStringTruncated(int right_pad, const char *s, int len = -1) {
-    PutCStringTruncatedWidth(right_pad, s, GetWidth(), len);
   }
 
   void MoveWindow(const Point &origin) {
@@ -708,9 +703,10 @@ public:
   void DrawTitledBox(const Rect &bounds, const char *title,
                      chtype v_char = ACS_VLINE, chtype h_char = ACS_HLINE) {
     DrawBox(bounds, v_char, h_char);
-    MoveCursor(bounds.origin.x + 2, bounds.origin.y);
+    int title_offset = 2;
+    MoveCursor(bounds.origin.x + title_offset, bounds.origin.y);
     PutChar('[');
-    PutCString(title);
+    PutCString(title, bounds.size.width - title_offset);
     PutChar(']');
   }
 
@@ -932,8 +928,10 @@ class TextFieldDelegate : public FieldDelegate {
 public:
   TextFieldDelegate(const char *label, int width, Point origin,
                     const char *content)
-      : m_label(label), m_width(width), m_origin(origin), m_content(content),
-        m_cursor_position(0), m_first_visibile_char(0) {
+      : m_label(label), m_width(width), m_origin(origin), m_cursor_position(0),
+        m_first_visibile_char(0) {
+    if (content)
+      m_content = content;
     assert(m_width > 2);
   }
 
@@ -968,7 +966,7 @@ public:
     // Draw content.
     window.MoveCursor(GetX(), GetY());
     const char *text = m_content.c_str() + m_first_visibile_char;
-    window.PutCStringTruncated(0, text, GetEffectiveWidth());
+    window.PutCString(text, GetEffectiveWidth());
 
     // Highlight the cursor.
     window.MoveCursor(GetCursorWindowXPosition(), GetY());
@@ -1057,7 +1055,7 @@ public:
   }
 
   // Returns the text content of the field.
-  std::string GetText() { return m_content; }
+  const std::string &GetText() { return m_content; }
 
 protected:
   std::string m_label;
@@ -1118,6 +1116,9 @@ public:
   HandleCharResult FieldDelegateHandleChar(int key) override {
     switch (key) {
     case ' ':
+    case '\r':
+    case '\n':
+    case KEY_ENTER:
       ToggleContent();
       return eKeyHandled;
     default:
@@ -1359,7 +1360,7 @@ public:
     // Draw field elements.
     m_delegate_sp->FormDelegateDraw(window, m_selected_field_index);
 
-    // Draw a horizontal line separating the fields and the button.
+    // Draw a horizontal line separating the fields and the submit button.
     window.MoveCursor(1, window.GetHeight() - 4);
     window.HorizontalLine(window.GetWidth() - 2);
 
@@ -1430,7 +1431,7 @@ public:
   }
 
   // When the selected field index is equal to the number of selected fields,
-  // this denotes that the button is selected.
+  // this denotes that the submit button is selected.
   bool IsButtonActive() {
     int number_of_fields = m_delegate_sp->FormDelegateGetNumberOfFields();
     return m_selected_field_index == number_of_fields;
@@ -1439,7 +1440,7 @@ public:
 protected:
   FormDelegateSP m_delegate_sp;
   // The index of the selected field. This can be equal to the number of fields,
-  // in which case, it denotes that the button is selected.
+  // in which case, it denotes that the submit button is selected.
   int m_selected_field_index;
 };
 
