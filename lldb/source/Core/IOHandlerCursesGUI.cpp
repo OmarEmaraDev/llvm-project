@@ -957,7 +957,7 @@ public:
     return GetX() + m_cursor_position - m_first_visibile_char;
   }
 
-  int GetContentLength() { return (int)m_content.length(); }
+  int GetContentLength() { return m_content.length(); }
 
   void FieldDelegateDraw(Window &window, bool is_active) override {
     // Draw label box.
@@ -1108,7 +1108,7 @@ public:
     window.PutChar('[');
     if (is_active)
       window.AttributeOn(A_REVERSE);
-    window.PutChar(m_content ? 'X' : ' ');
+    window.PutChar(m_content ? ACS_DIAMOND : ' ');
     if (is_active)
       window.AttributeOff(A_REVERSE);
     window.PutChar(']');
@@ -1118,8 +1118,20 @@ public:
 
   void ToggleContent() { m_content = !m_content; }
 
+  void SetContentToTrue() { m_content = true; }
+
+  void SetContentToFalse() { m_content = false; }
+
   HandleCharResult FieldDelegateHandleChar(int key) override {
     switch (key) {
+    case 't':
+    case '1':
+      SetContentToTrue();
+      return eKeyHandled;
+    case 'f':
+    case '0':
+      SetContentToFalse();
+      return eKeyHandled;
     case ' ':
     case '\r':
     case '\n':
@@ -1263,7 +1275,8 @@ protected:
 
 class Field {
 public:
-  Field(FieldDelegateSP &delegate_sp) : m_delegate_sp(delegate_sp) {}
+  Field(FieldDelegateSP &delegate_sp, int page_index)
+      : m_delegate_sp(delegate_sp), m_page_index(page_index) {}
 
   void Draw(Window &window, bool is_active) {
     m_delegate_sp->FieldDelegateDraw(window, is_active);
@@ -1273,13 +1286,17 @@ public:
     return m_delegate_sp->FieldDelegateHandleChar(key);
   }
 
+  int GetPageIndex() { return m_page_index; }
+
 protected:
   FieldDelegateSP m_delegate_sp;
+  // The index of the page this field belongs to.
+  int m_page_index;
 };
 
 class FormDelegate {
 public:
-  FormDelegate() : m_has_error(false) {}
+  FormDelegate() : m_has_error(false), m_last_page_index(0) {}
 
   virtual ~FormDelegate() = default;
 
@@ -1289,7 +1306,11 @@ public:
   }
 
   virtual void FormDelegateDraw(Window &window, int selected_field_index) {
-    for (int i = 0; i < FormDelegateGetNumberOfFields(); i++) {
+    int active_page_index = GetActivePageIndex(selected_field_index);
+    for (int i = 0; i < GetNumberOfFields(); i++) {
+      if (m_fields[i].GetPageIndex() != active_page_index)
+        continue;
+
       bool is_field_selected = selected_field_index == i;
       m_fields[i].Draw(window, is_field_selected);
     }
@@ -1299,11 +1320,22 @@ public:
   // method should set the m_error member to an appropriate error message.
   virtual bool FormDelegateSubmit() = 0;
 
-  int FormDelegateGetNumberOfFields() { return m_fields.size(); }
+  int GetNumberOfFields() { return m_fields.size(); }
 
   bool HasError() { return m_has_error; }
 
   std::string &GetError() { return m_error; }
+
+  // Return the index of the page that includes the selected field. If no field
+  // is selected, that is, if the selected field index is not in the correct
+  // range, return the last page index.
+  int GetActivePageIndex(int selected_field_index) {
+    if (selected_field_index < GetNumberOfFields())
+      return m_fields[selected_field_index].GetPageIndex();
+    return m_last_page_index;
+  }
+
+  int GetNumberOfPages() { return m_last_page_index + 1; }
 
   // Factory methods to create and add fields of specific types.
 
@@ -1312,7 +1344,7 @@ public:
     TextFieldDelegate *delegate =
         new TextFieldDelegate(label, width, origin, content);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp));
+    m_fields.push_back(Field(delegate_sp, m_last_page_index));
     return delegate;
   }
 
@@ -1321,7 +1353,7 @@ public:
     IntegerFieldDelegate *delegate =
         new IntegerFieldDelegate(label, width, origin, content);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp));
+    m_fields.push_back(Field(delegate_sp, m_last_page_index));
     return delegate;
   }
 
@@ -1330,7 +1362,7 @@ public:
     BooleanFieldDelegate *delegate =
         new BooleanFieldDelegate(label, origin, content);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp));
+    m_fields.push_back(Field(delegate_sp, m_last_page_index));
     return delegate;
   }
 
@@ -1340,14 +1372,18 @@ public:
     ChoicesFieldDelegate *delegate =
         new ChoicesFieldDelegate(label, width, height, origin, choices);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp));
+    m_fields.push_back(Field(delegate_sp, m_last_page_index));
     return delegate;
   }
+
+  void NewPage() { m_last_page_index++; }
 
 protected:
   bool m_has_error;
   std::string m_error;
   std::vector<Field> m_fields;
+  // The index of the last page.
+  int m_last_page_index;
 };
 
 typedef std::shared_ptr<FormDelegate> FormDelegateSP;
@@ -1356,6 +1392,54 @@ class FormWindowDelegate : public WindowDelegate {
 public:
   FormWindowDelegate(FormDelegateSP &delegate_sp)
       : m_delegate_sp(delegate_sp), m_selected_field_index(0) {}
+
+  // A form window is divided into two sections. A body section which is padded
+  // by one character from every direction and contains the fields. The body can
+  // have multiple "pages" which are switched automatically as the user selects
+  // next fields. The number of pages is signified by a number of centered dots
+  // at the last line of the body section, the active page will have its dot
+  // highlighted. Additionally a footer section contains the submit button in
+  // one line and a possible error message in the next line. Finally, a
+  // horizontal line separates both sections.
+  //
+  // ___<Form Name>_________________________________________________
+  // |                                                             |
+  // |                                                             |
+  // | Form elements here.                                         |
+  // |                                                             |
+  // |                            ...                              |
+  // |-------------------------------------------------------------|
+  // |                         [ SUBMIT ]                          |
+  // | Error message if it exists.                                 |
+  // |______________________________________[Press Esc to cancel]__|
+  //
+  // The following methods describe this structure in numbers.
+
+  int GetPageIndicatorYLocation(Window &window) {
+    return window.GetHeight() - 5;
+  }
+
+  int GetSeparatorYLocation(Window &window) { return window.GetHeight() - 4; }
+
+  int GetButtonYLocation(Window &window) { return window.GetHeight() - 3; }
+
+  void DrawPageIndicators(Window &window) {
+    int number_of_pages = m_delegate_sp->GetNumberOfPages();
+    if (number_of_pages == 1) {
+      return;
+    }
+    int x = (window.GetWidth() - number_of_pages) / 2;
+    window.MoveCursor(x, GetPageIndicatorYLocation(window));
+    int active_page = m_delegate_sp->GetActivePageIndex(m_selected_field_index);
+    for (int i = 0; i < number_of_pages; i++) {
+      bool is_active = active_page == i;
+      if (is_active)
+        window.AttributeOn(A_REVERSE);
+      window.PutChar(ACS_BULLET);
+      if (is_active)
+        window.AttributeOff(A_REVERSE);
+    }
+  }
 
   bool WindowDelegateDraw(Window &window, bool force) override {
     window.Erase();
@@ -1366,13 +1450,15 @@ public:
     m_delegate_sp->FormDelegateDraw(window, m_selected_field_index);
 
     // Draw a horizontal line separating the fields and the submit button.
-    window.MoveCursor(1, window.GetHeight() - 4);
+    window.MoveCursor(1, GetSeparatorYLocation(window));
     window.HorizontalLine(window.GetWidth() - 2);
+
+    DrawPageIndicators(window);
 
     // Draw the centered submit button.
     const char *button_text = "[Submit]";
     int x = (window.GetWidth() - sizeof(button_text) - 1) / 2;
-    window.MoveCursor(x, window.GetHeight() - 3);
+    window.MoveCursor(x, GetButtonYLocation(window));
     if (IsButtonActive())
       window.AttributeOn(A_REVERSE);
     window.PutCString(button_text);
@@ -1396,7 +1482,7 @@ public:
   // IsButtonActive().
   void SelectedNextField() {
     m_selected_field_index++;
-    int number_of_fields = m_delegate_sp->FormDelegateGetNumberOfFields();
+    int number_of_fields = m_delegate_sp->GetNumberOfFields();
     m_selected_field_index %= number_of_fields + 1;
   }
 
@@ -1438,7 +1524,7 @@ public:
   // When the selected field index is equal to the number of selected fields,
   // this denotes that the submit button is selected.
   bool IsButtonActive() {
-    int number_of_fields = m_delegate_sp->FormDelegateGetNumberOfFields();
+    int number_of_fields = m_delegate_sp->GetNumberOfFields();
     return m_selected_field_index == number_of_fields;
   }
 
