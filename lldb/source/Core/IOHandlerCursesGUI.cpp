@@ -920,6 +920,14 @@ public:
   virtual HandleCharResult FieldDelegateHandleChar(int key) {
     return eKeyNotHandled;
   }
+
+  void FieldDelegateSetPageIndex(int page_index) { m_page_index = page_index; }
+
+  int FieldDelegateGetPageIndex() { return m_page_index; }
+
+protected:
+  // The index of the page this field belongs to.
+  int m_page_index;
 };
 
 typedef std::shared_ptr<FieldDelegate> FieldDelegateSP;
@@ -1273,27 +1281,6 @@ protected:
   int m_first_visibile_choice;
 };
 
-class Field {
-public:
-  Field(FieldDelegateSP &delegate_sp, int page_index)
-      : m_delegate_sp(delegate_sp), m_page_index(page_index) {}
-
-  void Draw(Window &window, bool is_active) {
-    m_delegate_sp->FieldDelegateDraw(window, is_active);
-  }
-
-  HandleCharResult HandleChar(int key) {
-    return m_delegate_sp->FieldDelegateHandleChar(key);
-  }
-
-  int GetPageIndex() { return m_page_index; }
-
-protected:
-  FieldDelegateSP m_delegate_sp;
-  // The index of the page this field belongs to.
-  int m_page_index;
-};
-
 class FormDelegate {
 public:
   FormDelegate() : m_has_error(false), m_last_page_index(0) {}
@@ -1302,17 +1289,17 @@ public:
 
   virtual HandleCharResult FormDelegateHandleChar(int selected_field_index,
                                                   int key) {
-    return m_fields[selected_field_index].HandleChar(key);
+    return m_fields[selected_field_index]->FieldDelegateHandleChar(key);
   }
 
   virtual void FormDelegateDraw(Window &window, int selected_field_index) {
     int active_page_index = GetActivePageIndex(selected_field_index);
     for (int i = 0; i < GetNumberOfFields(); i++) {
-      if (m_fields[i].GetPageIndex() != active_page_index)
+      if (m_fields[i]->FieldDelegateGetPageIndex() != active_page_index)
         continue;
 
       bool is_field_selected = selected_field_index == i;
-      m_fields[i].Draw(window, is_field_selected);
+      m_fields[i]->FieldDelegateDraw(window, is_field_selected);
     }
   }
 
@@ -1331,7 +1318,7 @@ public:
   // range, return the last page index.
   int GetActivePageIndex(int selected_field_index) {
     if (selected_field_index < GetNumberOfFields())
-      return m_fields[selected_field_index].GetPageIndex();
+      return m_fields[selected_field_index]->FieldDelegateGetPageIndex();
     return m_last_page_index;
   }
 
@@ -1344,7 +1331,8 @@ public:
     TextFieldDelegate *delegate =
         new TextFieldDelegate(label, width, origin, content);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp, m_last_page_index));
+    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
+    m_fields.push_back(delegate_sp);
     return delegate;
   }
 
@@ -1353,7 +1341,8 @@ public:
     IntegerFieldDelegate *delegate =
         new IntegerFieldDelegate(label, width, origin, content);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp, m_last_page_index));
+    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
+    m_fields.push_back(delegate_sp);
     return delegate;
   }
 
@@ -1362,7 +1351,8 @@ public:
     BooleanFieldDelegate *delegate =
         new BooleanFieldDelegate(label, origin, content);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp, m_last_page_index));
+    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
+    m_fields.push_back(delegate_sp);
     return delegate;
   }
 
@@ -1372,7 +1362,8 @@ public:
     ChoicesFieldDelegate *delegate =
         new ChoicesFieldDelegate(label, width, height, origin, choices);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    m_fields.push_back(Field(delegate_sp, m_last_page_index));
+    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
+    m_fields.push_back(delegate_sp);
     return delegate;
   }
 
@@ -1381,7 +1372,7 @@ public:
 protected:
   bool m_has_error;
   std::string m_error;
-  std::vector<Field> m_fields;
+  std::vector<FieldDelegateSP> m_fields;
   // The index of the last page.
   int m_last_page_index;
 };
