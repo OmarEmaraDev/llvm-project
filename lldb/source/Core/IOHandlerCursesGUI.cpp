@@ -336,131 +336,57 @@ protected:
   int m_first_visible_line;
 };
 
-class Window {
+// A surface is an abstraction for something than can be drawn on. The surface
+// have a width, a height, a cursor position, and a multitude of drawing
+// operations. This type should be sub-classed to get an actually useful ncurses
+// object, such as a Window, SubWindow, Pad, or a SubPad.
+class Surface {
 public:
-  Window(const char *name)
-      : m_name(name), m_window(nullptr), m_panel(nullptr), m_parent(nullptr),
-        m_subwindows(), m_delegate_sp(), m_curr_active_window_idx(UINT32_MAX),
-        m_prev_active_window_idx(UINT32_MAX), m_delete(false),
-        m_needs_update(true), m_can_activate(true), m_is_subwin(false) {}
+  Surface() : m_window(nullptr) {}
 
-  Window(const char *name, WINDOW *w, bool del = true)
-      : m_name(name), m_window(nullptr), m_panel(nullptr), m_parent(nullptr),
-        m_subwindows(), m_delegate_sp(), m_curr_active_window_idx(UINT32_MAX),
-        m_prev_active_window_idx(UINT32_MAX), m_delete(del),
-        m_needs_update(true), m_can_activate(true), m_is_subwin(false) {
-    if (w)
-      Reset(w);
+  WINDOW *get() { return m_window; }
+
+  operator WINDOW *() { return m_window; }
+
+  // Copy a region of the surface to another surface.
+  void CopyToSurface(Surface &target, Point source_origin, Point target_origin,
+                     Size size) {
+    ::copywin(m_window, target.get(), source_origin.y, source_origin.x,
+              target_origin.y, target_origin.x,
+              target_origin.y + size.height - 1,
+              target_origin.x + size.width - 1, false);
   }
 
-  Window(const char *name, const Rect &bounds)
-      : m_name(name), m_window(nullptr), m_parent(nullptr), m_subwindows(),
-        m_delegate_sp(), m_curr_active_window_idx(UINT32_MAX),
-        m_prev_active_window_idx(UINT32_MAX), m_delete(true),
-        m_needs_update(true), m_can_activate(true), m_is_subwin(false) {
-    Reset(::newwin(bounds.size.height, bounds.size.width, bounds.origin.y,
-                   bounds.origin.y));
-  }
-
-  virtual ~Window() {
-    RemoveSubWindows();
-    Reset();
-  }
-
-  void Reset(WINDOW *w = nullptr, bool del = true) {
-    if (m_window == w)
-      return;
-
-    if (m_panel) {
-      ::del_panel(m_panel);
-      m_panel = nullptr;
-    }
-    if (m_window && m_delete) {
-      ::delwin(m_window);
-      m_window = nullptr;
-      m_delete = false;
-    }
-    if (w) {
-      m_window = w;
-      m_panel = ::new_panel(m_window);
-      m_delete = del;
-    }
-  }
+  int GetCursorX() const { return getcurx(m_window); }
+  int GetCursorY() const { return getcury(m_window); }
+  void MoveCursor(int x, int y) { ::wmove(m_window, y, x); }
 
   void AttributeOn(attr_t attr) { ::wattron(m_window, attr); }
   void AttributeOff(attr_t attr) { ::wattroff(m_window, attr); }
-  void Box(chtype v_char = ACS_VLINE, chtype h_char = ACS_HLINE) {
-    ::box(m_window, v_char, h_char);
-  }
-  void VerticalLine(int n, chtype v_char = ACS_VLINE) {
-    ::wvline(m_window, v_char, n);
-  }
-  void HorizontalLine(int n, chtype h_char = ACS_HLINE) {
-    ::whline(m_window, h_char, n);
-  }
-  void Clear() { ::wclear(m_window); }
-  void Erase() { ::werase(m_window); }
-  Rect GetBounds() const {
-    return Rect(GetParentOrigin(), GetSize());
-  } // Get the rectangle in our parent window
-  int GetChar() { return ::wgetch(m_window); }
-  int GetCursorX() const { return getcurx(m_window); }
-  int GetCursorY() const { return getcury(m_window); }
-  Rect GetFrame() const {
-    return Rect(Point(), GetSize());
-  } // Get our rectangle in our own coordinate system
-  Point GetParentOrigin() const { return Point(GetParentX(), GetParentY()); }
-  Size GetSize() const { return Size(GetWidth(), GetHeight()); }
-  int GetParentX() const { return getparx(m_window); }
-  int GetParentY() const { return getpary(m_window); }
+
   int GetMaxX() const { return getmaxx(m_window); }
   int GetMaxY() const { return getmaxy(m_window); }
   int GetWidth() const { return GetMaxX(); }
   int GetHeight() const { return GetMaxY(); }
-  void MoveCursor(int x, int y) { ::wmove(m_window, y, x); }
-  void MoveWindow(int x, int y) { MoveWindow(Point(x, y)); }
-  void Resize(int w, int h) { ::wresize(m_window, h, w); }
-  void Resize(const Size &size) {
-    ::wresize(m_window, size.height, size.width);
-  }
-  void PutChar(int ch) { ::waddch(m_window, ch); }
-  void PutCString(const char *s, int len = -1) { ::waddnstr(m_window, s, len); }
+  Size GetSize() const { return Size(GetWidth(), GetHeight()); }
+  // Get a zero origin rectangle width the surface size.
+  Rect GetFrame() const { return Rect(Point(), GetSize()); }
+
+  void Clear() { ::wclear(m_window); }
+  void Erase() { ::werase(m_window); }
+
   void SetBackground(int color_pair_idx) {
     ::wbkgd(m_window, COLOR_PAIR(color_pair_idx));
   }
+
+  void PutChar(int ch) { ::waddch(m_window, ch); }
+  void PutCString(const char *s, int len = -1) { ::waddnstr(m_window, s, len); }
 
   void PutCStringTruncated(int right_pad, const char *s, int len = -1) {
     int bytes_left = GetWidth() - GetCursorX();
     if (bytes_left > right_pad) {
       bytes_left -= right_pad;
       ::waddnstr(m_window, s, len < 0 ? bytes_left : std::min(bytes_left, len));
-    }
-  }
-
-  void MoveWindow(const Point &origin) {
-    const bool moving_window = origin != GetParentOrigin();
-    if (m_is_subwin && moving_window) {
-      // Can't move subwindows, must delete and re-create
-      Size size = GetSize();
-      Reset(::subwin(m_parent->m_window, size.height, size.width, origin.y,
-                     origin.x),
-            true);
-    } else {
-      ::mvwin(m_window, origin.y, origin.x);
-    }
-  }
-
-  void SetBounds(const Rect &bounds) {
-    const bool moving_window = bounds.origin != GetParentOrigin();
-    if (m_is_subwin && moving_window) {
-      // Can't move subwindows, must delete and re-create
-      Reset(::subwin(m_parent->m_window, bounds.size.height, bounds.size.width,
-                     bounds.origin.y, bounds.origin.x),
-            true);
-    } else {
-      if (moving_window)
-        MoveWindow(bounds.origin);
-      Resize(bounds.size);
     }
   }
 
@@ -481,8 +407,54 @@ public:
     PutCStringTruncated(right_pad, strm.GetData());
   }
 
-  size_t LimitLengthToRestOfLine(size_t length) const {
-    return std::min<size_t>(length, std::max(0, GetWidth() - GetCursorX() - 1));
+  void VerticalLine(int n, chtype v_char = ACS_VLINE) {
+    ::wvline(m_window, v_char, n);
+  }
+  void HorizontalLine(int n, chtype h_char = ACS_HLINE) {
+    ::whline(m_window, h_char, n);
+  }
+  void Box(chtype v_char = ACS_VLINE, chtype h_char = ACS_HLINE) {
+    ::box(m_window, v_char, h_char);
+  }
+
+  void TitledBox(const char *title, chtype v_char = ACS_VLINE,
+                 chtype h_char = ACS_HLINE) {
+    Box(v_char, h_char);
+    int title_offset = 2;
+    MoveCursor(title_offset, 0);
+    PutChar('[');
+    PutCString(title, GetWidth() - title_offset);
+    PutChar(']');
+  }
+
+  void Box(const Rect &bounds, chtype v_char = ACS_VLINE,
+           chtype h_char = ACS_HLINE) {
+    MoveCursor(bounds.origin.x, bounds.origin.y);
+    VerticalLine(bounds.size.height);
+    HorizontalLine(bounds.size.width);
+    PutChar(ACS_ULCORNER);
+
+    MoveCursor(bounds.origin.x + bounds.size.width - 1, bounds.origin.y);
+    VerticalLine(bounds.size.height);
+    PutChar(ACS_URCORNER);
+
+    MoveCursor(bounds.origin.x, bounds.origin.y + bounds.size.height - 1);
+    HorizontalLine(bounds.size.width);
+    PutChar(ACS_LLCORNER);
+
+    MoveCursor(bounds.origin.x + bounds.size.width - 1,
+               bounds.origin.y + bounds.size.height - 1);
+    PutChar(ACS_LRCORNER);
+  }
+
+  void TitledBox(const Rect &bounds, const char *title,
+                 chtype v_char = ACS_VLINE, chtype h_char = ACS_HLINE) {
+    Box(bounds, v_char, h_char);
+    int title_offset = 2;
+    MoveCursor(bounds.origin.x + title_offset, bounds.origin.y);
+    PutChar('[');
+    PutCString(title, bounds.size.width - title_offset);
+    PutChar(']');
   }
 
   // Curses doesn't allow direct output of color escape sequences, but that's
@@ -556,6 +528,120 @@ public:
     }
     wattr_set(m_window, saved_attr, saved_pair, nullptr);
     return result;
+  }
+
+protected:
+  WINDOW *m_window;
+};
+
+class Pad : public Surface {
+public:
+  Pad(Size size) { m_window = ::newpad(size.height, size.width); }
+
+  ~Pad() { ::delwin(m_window); }
+};
+
+class SubPad : public Surface {
+public:
+  SubPad(Pad &pad, Rect bounds) {
+    m_window = ::subpad(pad.get(), bounds.size.height, bounds.size.width,
+                        bounds.origin.y, bounds.origin.x);
+  }
+  SubPad(SubPad &subpad, Rect bounds) {
+    m_window = ::subpad(subpad.get(), bounds.size.height, bounds.size.width,
+                        bounds.origin.y, bounds.origin.x);
+  }
+
+  ~SubPad() { ::delwin(m_window); }
+};
+
+class Window : public Surface {
+public:
+  Window(const char *name)
+      : m_name(name), m_panel(nullptr), m_parent(nullptr), m_subwindows(),
+        m_delegate_sp(), m_curr_active_window_idx(UINT32_MAX),
+        m_prev_active_window_idx(UINT32_MAX), m_delete(false),
+        m_needs_update(true), m_can_activate(true), m_is_subwin(false) {}
+
+  Window(const char *name, WINDOW *w, bool del = true)
+      : m_name(name), m_panel(nullptr), m_parent(nullptr), m_subwindows(),
+        m_delegate_sp(), m_curr_active_window_idx(UINT32_MAX),
+        m_prev_active_window_idx(UINT32_MAX), m_delete(del),
+        m_needs_update(true), m_can_activate(true), m_is_subwin(false) {
+    if (w)
+      Reset(w);
+  }
+
+  Window(const char *name, const Rect &bounds)
+      : m_name(name), m_parent(nullptr), m_subwindows(), m_delegate_sp(),
+        m_curr_active_window_idx(UINT32_MAX),
+        m_prev_active_window_idx(UINT32_MAX), m_delete(true),
+        m_needs_update(true), m_can_activate(true), m_is_subwin(false) {
+    Reset(::newwin(bounds.size.height, bounds.size.width, bounds.origin.y,
+                   bounds.origin.y));
+  }
+
+  virtual ~Window() {
+    RemoveSubWindows();
+    Reset();
+  }
+
+  void Reset(WINDOW *w = nullptr, bool del = true) {
+    if (m_window == w)
+      return;
+
+    if (m_panel) {
+      ::del_panel(m_panel);
+      m_panel = nullptr;
+    }
+    if (m_window && m_delete) {
+      ::delwin(m_window);
+      m_window = nullptr;
+      m_delete = false;
+    }
+    if (w) {
+      m_window = w;
+      m_panel = ::new_panel(m_window);
+      m_delete = del;
+    }
+  }
+  //
+  // Get the rectangle in our parent window
+  Rect GetBounds() const { return Rect(GetParentOrigin(), GetSize()); }
+  int GetChar() { return ::wgetch(m_window); }
+  Point GetParentOrigin() const { return Point(GetParentX(), GetParentY()); }
+  int GetParentX() const { return getparx(m_window); }
+  int GetParentY() const { return getpary(m_window); }
+  void MoveWindow(int x, int y) { MoveWindow(Point(x, y)); }
+  void Resize(int w, int h) { ::wresize(m_window, h, w); }
+  void Resize(const Size &size) {
+    ::wresize(m_window, size.height, size.width);
+  }
+  void MoveWindow(const Point &origin) {
+    const bool moving_window = origin != GetParentOrigin();
+    if (m_is_subwin && moving_window) {
+      // Can't move subwindows, must delete and re-create
+      Size size = GetSize();
+      Reset(::subwin(m_parent->m_window, size.height, size.width, origin.y,
+                     origin.x),
+            true);
+    } else {
+      ::mvwin(m_window, origin.y, origin.x);
+    }
+  }
+
+  void SetBounds(const Rect &bounds) {
+    const bool moving_window = bounds.origin != GetParentOrigin();
+    if (m_is_subwin && moving_window) {
+      // Can't move subwindows, must delete and re-create
+      Reset(::subwin(m_parent->m_window, bounds.size.height, bounds.size.width,
+                     bounds.origin.y, bounds.origin.x),
+            true);
+    } else {
+      if (moving_window)
+        MoveWindow(bounds.origin);
+      Resize(bounds.size);
+    }
   }
 
   void Touch() {
@@ -638,10 +724,6 @@ public:
       ::touchwin(stdscr);
   }
 
-  WINDOW *get() { return m_window; }
-
-  operator WINDOW *() { return m_window; }
-
   // Window drawing utilities
   void DrawTitleBox(const char *title, const char *bottom_message = nullptr) {
     attr_t attr = 0;
@@ -678,36 +760,6 @@ public:
     }
     if (attr)
       AttributeOff(attr);
-  }
-
-  void DrawBox(const Rect &bounds, chtype v_char = ACS_VLINE,
-               chtype h_char = ACS_HLINE) {
-    MoveCursor(bounds.origin.x, bounds.origin.y);
-    VerticalLine(bounds.size.height);
-    HorizontalLine(bounds.size.width);
-    PutChar(ACS_ULCORNER);
-
-    MoveCursor(bounds.origin.x + bounds.size.width - 1, bounds.origin.y);
-    VerticalLine(bounds.size.height);
-    PutChar(ACS_URCORNER);
-
-    MoveCursor(bounds.origin.x, bounds.origin.y + bounds.size.height - 1);
-    HorizontalLine(bounds.size.width);
-    PutChar(ACS_LLCORNER);
-
-    MoveCursor(bounds.origin.x + bounds.size.width - 1,
-               bounds.origin.y + bounds.size.height - 1);
-    PutChar(ACS_LRCORNER);
-  }
-
-  void DrawTitledBox(const Rect &bounds, const char *title,
-                     chtype v_char = ACS_VLINE, chtype h_char = ACS_HLINE) {
-    DrawBox(bounds, v_char, h_char);
-    int title_offset = 2;
-    MoveCursor(bounds.origin.x + title_offset, bounds.origin.y);
-    PutChar('[');
-    PutCString(title, bounds.size.width - title_offset);
-    PutChar(']');
   }
 
   virtual void Draw(bool force) {
@@ -888,7 +940,6 @@ public:
 
 protected:
   std::string m_name;
-  WINDOW *m_window;
   PANEL *m_panel;
   Window *m_parent;
   Windows m_subwindows;
@@ -913,80 +964,129 @@ class FieldDelegate {
 public:
   virtual ~FieldDelegate() = default;
 
-  virtual Rect FieldDelegateGetBounds() = 0;
+  // Returns the number of lines needed to draw the field. The draw method will
+  // be given a surface that have exactly this number of lines.
+  virtual int FieldDelegateGetHeight() = 0;
 
-  virtual void FieldDelegateDraw(Window &window, bool is_active) = 0;
+  // Draw the field in the given subpad surface. The surface have a height that
+  // is equal to the height returned by FieldDelegateGetHeight(). If the field
+  // is selected in the form window, then is_selected will be true.
+  virtual void FieldDelegateDraw(SubPad &surface, bool is_selected) = 0;
 
+  // Handle the key that wasn't handled by the form window or a composing field.
+  // Navigation keys are treated specially, see FieldDelegateYieldNavigation().
   virtual HandleCharResult FieldDelegateHandleChar(int key) {
     return eKeyNotHandled;
   }
 
-  void FieldDelegateSetPageIndex(int page_index) { m_page_index = page_index; }
+  // This is executed once the user exists the field, that is, once the user
+  // navigates to the next field. This is particularly useful to do in-field
+  // validation and error setting.
+  virtual void FieldDelegateExitCallback() { return; }
 
-  int FieldDelegateGetPageIndex() { return m_page_index; }
-
-protected:
-  // The index of the page this field belongs to.
-  int m_page_index;
+  // Fields may have internal navigation, for instance, a List Field need to
+  // handle the navigation keys to navigate its content when it is active (For
+  // instance, select the next field in the list when the tab key is pressed).
+  // To allow for this mechanism, the form window first calls this method on the
+  // active field, essentially asking the field to yield navigation to the
+  // window. The field may refuse by retuning false if it still needs to do
+  // internal navigation. Alternatively, the field may agree to yield navigation
+  // by retuning true, this is typically done when the last element in the field
+  // is selected. Additionally, the field may update its state accordingly, for
+  // instance, if the field is yielding, it may set its selected element to be
+  // the first one, such that when the window activates the element again, it
+  // becomes in a non-yielding state.
+  virtual bool FieldDelegateYieldNavigation() { return true; }
 };
 
 typedef std::shared_ptr<FieldDelegate> FieldDelegateSP;
 
 class TextFieldDelegate : public FieldDelegate {
 public:
-  TextFieldDelegate(const char *label, int width, Point origin,
-                    const char *content)
-      : m_label(label), m_width(width), m_origin(origin), m_cursor_position(0),
-        m_first_visibile_char(0) {
+  TextFieldDelegate(const char *label, const char *content)
+      : m_label(label), m_cursor_position(0), m_first_visibile_char(0) {
     if (content)
       m_content = content;
-    assert(m_width > 2);
   }
 
-  // Get the bounding box of the field. The text field has a height of 3, 2
-  // lines for borders and 1 for the content.
-  Rect FieldDelegateGetBounds() override {
-    return Rect(m_origin, Size(m_width, 3));
+  // Text fields are drawn as titled boxes of a single line, with a possible
+  // error messages at the end.
+  //
+  // __[Label]___________
+  // |                  |
+  // |__________________|
+  // - Error message if it exists.
+
+  // The text field has a height of 3 lines. 2 lines for borders and 1 line for
+  // the content.
+  int GetFieldHeight() { return 3; }
+
+  // The text field has a full height of 3 or 4 lines. 3 lines for the actual
+  // field and an optional line for an error if it exists.
+  int FieldDelegateGetHeight() override {
+    int height = GetFieldHeight();
+    if (HasError())
+      height++;
+    return height;
   }
 
-  // Get the start X position of the content in window space, without the
-  // borders.
-  int GetX() { return m_origin.x + 1; }
-
-  // Get the start Y position of the content in window space, without the
-  // borders.
-  int GetY() { return m_origin.y + 1; }
-
-  // Get the effective width of the field, without the borders.
-  int GetEffectiveWidth() { return m_width - 2; }
-
-  // Get the cursor position in window space.
-  int GetCursorWindowXPosition() {
-    return GetX() + m_cursor_position - m_first_visibile_char;
-  }
+  // Get the cursor X position in the surface coordinate.
+  int GetCursorXPosition() { return m_cursor_position - m_first_visibile_char; }
 
   int GetContentLength() { return m_content.length(); }
 
-  void FieldDelegateDraw(Window &window, bool is_active) override {
-    // Draw label box.
-    window.DrawTitledBox(FieldDelegateGetBounds(), m_label.c_str());
-
-    // Draw content.
-    window.MoveCursor(GetX(), GetY());
+  void DrawContent(SubPad &surface, bool is_selected) {
+    surface.MoveCursor(0, 0);
     const char *text = m_content.c_str() + m_first_visibile_char;
-    window.PutCString(text, GetEffectiveWidth());
+    surface.PutCString(text, surface.GetWidth());
+    m_last_drawn_content_width = surface.GetWidth();
 
     // Highlight the cursor.
-    window.MoveCursor(GetCursorWindowXPosition(), GetY());
-    if (is_active)
-      window.AttributeOn(A_REVERSE);
+    surface.MoveCursor(GetCursorXPosition(), 0);
+    if (is_selected)
+      surface.AttributeOn(A_REVERSE);
     if (m_cursor_position == GetContentLength())
       // Cursor is past the last character. Highlight an empty space.
-      window.PutChar(' ');
+      surface.PutChar(' ');
     else
-      window.PutChar(m_content[m_cursor_position]);
-    if (is_active)
-      window.AttributeOff(A_REVERSE);
+      surface.PutChar(m_content[m_cursor_position]);
+    if (is_selected)
+      surface.AttributeOff(A_REVERSE);
+  }
+
+  void DrawField(SubPad &surface, bool is_selected) {
+    // Draw label box.
+    surface.TitledBox(m_label.c_str());
+
+    // Create subpad for drawing content.
+    Rect content_bounds = surface.GetFrame();
+    content_bounds.Inset(1, 1);
+    SubPad content_surface = SubPad(surface, content_bounds);
+
+    DrawContent(content_surface, is_selected);
+  }
+
+  void DrawError(SubPad &surface) {
+    if (!HasError())
+      return;
+    surface.MoveCursor(0, 0);
+    surface.AttributeOn(COLOR_PAIR(RedOnBlack));
+    surface.PutChar(ACS_DIAMOND);
+    surface.PutChar(' ');
+    surface.PutCStringTruncated(1, GetError().c_str());
+    surface.AttributeOff(COLOR_PAIR(RedOnBlack));
+  }
+
+  void FieldDelegateDraw(SubPad &surface, bool is_selected) override {
+    // Create subpads for drawing the field and possibly the error message.
+    Rect frame = surface.GetFrame();
+    Rect field_bounds, error_bounds;
+    frame.HorizontalSplit(GetFieldHeight(), field_bounds, error_bounds);
+    SubPad field_surface = SubPad(surface, field_bounds);
+    SubPad error_surface = SubPad(surface, error_bounds);
+
+    DrawField(field_surface, is_selected);
+    DrawError(error_surface);
   }
 
   // The cursor is allowed to move one character past the string.
@@ -1004,7 +1104,7 @@ public:
   // If the cursor moved past the last visible character, scroll right by one
   // character.
   void ScrollRightIfNeeded() {
-    if (m_cursor_position - m_first_visibile_char == GetEffectiveWidth())
+    if (m_cursor_position - m_first_visibile_char == m_last_drawn_content_width)
       m_first_visibile_char++;
   }
 
@@ -1045,6 +1145,7 @@ public:
 
   HandleCharResult FieldDelegateHandleChar(int key) override {
     if (IsAcceptableChar(key)) {
+      ClearError();
       InsertChar((char)key);
       return eKeyHandled;
     }
@@ -1059,6 +1160,7 @@ public:
       ScrollLeftIfNeeded();
       return eKeyHandled;
     case KEY_BACKSPACE:
+      ClearError();
       RemoveChar();
       return eKeyHandled;
     default:
@@ -1067,29 +1169,37 @@ public:
     return eKeyNotHandled;
   }
 
+  bool HasError() { return !m_error.empty(); }
+
+  void ClearError() { m_error.clear(); }
+
+  const std::string &GetError() { return m_error; }
+
+  void SetError(const char *error) { m_error = error; }
+
   // Returns the text content of the field.
   const std::string &GetText() { return m_content; }
 
 protected:
   std::string m_label;
-  // The total width of the field, including the two border characters. So the
-  // effective width is two characters less.
-  int m_width;
   // The position of the top left corner character of the border.
-  Point m_origin;
   std::string m_content;
   // The cursor position in the content string itself. Can be in the range
   // [0, GetContentLength()].
   int m_cursor_position;
   // The index of the first visible character in the content.
   int m_first_visibile_char;
+  // The width of the fields content that was last drawn. Width can change, so
+  // this is used to determine if scrolling is needed dynamically.
+  int m_last_drawn_content_width;
+  // Optional error message. If empty, field is considered to have no error.
+  std::string m_error;
 };
 
 class IntegerFieldDelegate : public TextFieldDelegate {
 public:
-  IntegerFieldDelegate(const char *label, int width, Point origin, int content)
-      : TextFieldDelegate(label, width, origin,
-                          std::to_string(content).c_str()) {}
+  IntegerFieldDelegate(const char *label, int content)
+      : TextFieldDelegate(label, std::to_string(content).c_str()) {}
 
   // Only accept digits.
   bool IsAcceptableChar(int key) override { return isdigit(key); }
@@ -1098,30 +1208,83 @@ public:
   int GetInteger() { return std::stoi(m_content); }
 };
 
-class BooleanFieldDelegate : public FieldDelegate {
+class FileFieldDelegate : public TextFieldDelegate {
 public:
-  BooleanFieldDelegate(const char *label, Point origin, bool content)
-      : m_label(label), m_origin(origin), m_content(content) {}
+  FileFieldDelegate(const char *label, const char *content,
+                    bool need_to_exist = true)
+      : TextFieldDelegate(label, content), m_need_to_exist(need_to_exist) {}
 
-  // Get the bounding box of the field. The boolean field is drawn as follows:
-  // [X] Label  or [ ] Label
-  // So 4 characters plus the length of the label. And only a single line.
-  Rect FieldDelegateGetBounds() override {
-    return Rect(m_origin, Size(4 + m_label.length(), 1));
+  // Set appropriate error messages if the file doesn't exists or is, in fact, a
+  // directory.
+  void FieldDelegateExitCallback() override {
+    FileSpec file(GetPath());
+    if (m_need_to_exist && !FileSystem::Instance().Exists(file)) {
+      SetError("File doesn't exist!");
+      return;
+    }
+    if (FileSystem::Instance().IsDirectory(file)) {
+      SetError("Not a file!");
+      return;
+    }
   }
 
+  // Returns the path of the file.
+  const std::string &GetPath() { return m_content; }
+
+protected:
+  bool m_need_to_exist;
+};
+
+class DirectoryFieldDelegate : public TextFieldDelegate {
+public:
+  DirectoryFieldDelegate(const char *label, const char *content,
+                         bool need_to_exist = true)
+      : TextFieldDelegate(label, content), m_need_to_exist(need_to_exist) {}
+
+  // Set appropriate error messages if the directory doesn't exists or is, in
+  // fact, a file.
+  void FieldDelegateExitCallback() override {
+    FileSpec file(GetPath());
+    if (m_need_to_exist && !FileSystem::Instance().Exists(file)) {
+      SetError("Directory doesn't exist!");
+      return;
+    }
+    if (!FileSystem::Instance().IsDirectory(file)) {
+      SetError("Not a directory!");
+      return;
+    }
+  }
+
+  // Returns the path of the file.
+  const std::string &GetPath() { return m_content; }
+
+protected:
+  bool m_need_to_exist;
+};
+
+class BooleanFieldDelegate : public FieldDelegate {
+public:
+  BooleanFieldDelegate(const char *label, bool content)
+      : m_label(label), m_content(content) {}
+
+  // Boolean fields are drawn as checkboxes.
+  //
   // [X] Label  or [ ] Label
-  void FieldDelegateDraw(Window &window, bool is_active) override {
-    window.MoveCursor(m_origin.x, m_origin.y);
-    window.PutChar('[');
-    if (is_active)
-      window.AttributeOn(A_REVERSE);
-    window.PutChar(m_content ? ACS_DIAMOND : ' ');
-    if (is_active)
-      window.AttributeOff(A_REVERSE);
-    window.PutChar(']');
-    window.PutChar(' ');
-    window.PutCString(m_label.c_str());
+
+  // Boolean fields are have a single line.
+  int FieldDelegateGetHeight() override { return 1; }
+
+  void FieldDelegateDraw(SubPad &surface, bool is_selected) override {
+    surface.MoveCursor(0, 0);
+    surface.PutChar('[');
+    if (is_selected)
+      surface.AttributeOn(A_REVERSE);
+    surface.PutChar(m_content ? ACS_DIAMOND : ' ');
+    if (is_selected)
+      surface.AttributeOff(A_REVERSE);
+    surface.PutChar(']');
+    surface.PutChar(' ');
+    surface.PutCString(m_label.c_str());
   }
 
   void ToggleContent() { m_content = !m_content; }
@@ -1157,65 +1320,66 @@ public:
 
 protected:
   std::string m_label;
-  // The window space position of the first character.
-  Point m_origin;
   bool m_content;
 };
 
 class ChoicesFieldDelegate : public FieldDelegate {
 public:
-  ChoicesFieldDelegate(const char *label, int width, int height, Point origin,
+  ChoicesFieldDelegate(const char *label, int number_of_visible_choices,
                        std::vector<std::string> choices)
-      : m_label(label), m_width(width), m_height(height), m_origin(origin),
-        m_choices(choices), m_choice(0), m_first_visibile_choice(0) {
-    assert(m_width > 3);
-    assert(m_height > 2);
-  }
+      : m_label(label), m_number_of_visible_choices(number_of_visible_choices),
+        m_choices(choices), m_choice(0), m_first_visibile_choice(0) {}
 
-  // Get the bounding box of the field. The height is 2 border characters with
-  // one or more space to show choices in a list.
-  Rect FieldDelegateGetBounds() override {
-    return Rect(m_origin, Size(m_width, m_height));
-  }
-
-  // Get the X position of the choices in window space, without the borders.
-  int GetX() { return m_origin.x + 1; }
-
-  // Get the Y position of the first visible choice in window space.
-  int GetY() { return m_origin.y + 1; }
-
-  // Get the effective width of the field, without the borders.
-  int GetEffectiveWidth() { return m_width - 2; }
+  // Choices fields are drawn as titles boxses of a number of visible choices.
+  // The rest of the choices become visible as the user scroll. The selected
+  // choice is denoted by a diamond as the first character.
   //
-  // Get the effective height of the field, without the borders.
-  int GetEffectiveHeight() { return m_height - 2; }
+  // __[Label]___________
+  // |-Choice 1         |
+  // | Choice 2         |
+  // | Choice 3         |
+  // |__________________|
+
+  // Choices field have two border characters plus the number of visible
+  // choices.
+  int FieldDelegateGetHeight() override {
+    return m_number_of_visible_choices + 2;
+  }
 
   int GetNumberOfChoices() { return m_choices.size(); }
 
   // Get the index of the last visible choice.
   int GetLastVisibleChoice() {
-    return std::min(m_first_visibile_choice + GetEffectiveHeight() - 1,
-                    GetNumberOfChoices() - 1);
+    int index = m_first_visibile_choice + m_number_of_visible_choices;
+    return std::min(index, GetNumberOfChoices()) - 1;
   }
 
-  void FieldDelegateDraw(Window &window, bool is_active) override {
-    // Draw label box.
-    window.DrawTitledBox(FieldDelegateGetBounds(), m_label.c_str());
-
-    // Draw content.
+  void DrawContent(SubPad &surface, bool is_selected) {
     int choices_to_draw = GetLastVisibleChoice() - m_first_visibile_choice + 1;
     for (int i = 0; i < choices_to_draw; i++) {
-      window.MoveCursor(GetX(), GetY() + i);
+      surface.MoveCursor(0, i);
       int current_choice = m_first_visibile_choice + i;
       const char *text = m_choices[current_choice].c_str();
-      bool highlight = is_active && current_choice == m_choice;
+      bool highlight = is_selected && current_choice == m_choice;
       if (highlight)
-        window.AttributeOn(A_REVERSE);
-      window.PutChar(current_choice == m_choice ? ACS_DIAMOND : ' ');
-      window.PutCString(text);
+        surface.AttributeOn(A_REVERSE);
+      surface.PutChar(current_choice == m_choice ? ACS_DIAMOND : ' ');
+      surface.PutCString(text);
       if (highlight)
-        window.AttributeOff(A_REVERSE);
+        surface.AttributeOff(A_REVERSE);
     }
+  }
+
+  void FieldDelegateDraw(SubPad &surface, bool is_selected) override {
+    // Draw label box.
+    surface.TitledBox(m_label.c_str());
+
+    // Create subpad for drawing content.
+    Rect content_bounds = surface.GetFrame();
+    content_bounds.Inset(1, 1);
+    SubPad content_surface = SubPad(surface, content_bounds);
+
+    DrawContent(content_surface, is_selected);
   }
 
   void SelectPrevious() {
@@ -1266,14 +1430,7 @@ public:
 
 protected:
   std::string m_label;
-  // The total width of the field, including the two border characters. So the
-  // effective width is two characters less.
-  int m_width;
-  // The total height of the field, including the two border characters. So the
-  // effective width is two characters less.
-  int m_height;
-  // The position of the top left corner character of the border.
-  Point m_origin;
+  int m_number_of_visible_choices;
   std::vector<std::string> m_choices;
   // The index of the selected choice.
   int m_choice;
@@ -1281,9 +1438,211 @@ protected:
   int m_first_visibile_choice;
 };
 
+template <class T> class ListFieldDelegate : public FieldDelegate {
+public:
+  ListFieldDelegate(const char *label, T default_field)
+      : m_label(label), m_default_field(default_field),
+        m_selected_field_index(0), m_current_selection(Selected::NewButton) {}
+
+  // Signify which element is selected.
+  enum class Selected { Field, RemoveButton, NewButton };
+
+  // List fields are drawn as titles boxses of a number of other fields of the
+  // same type. Each field has a Remove button next to it that removes the
+  // corresponding field. Finally, the last line contains a New button to add a
+  // new field.
+  //
+  // __[Label]___________
+  // | Field 1 [Remove] |
+  // | Field 2 [Remove] |
+  // | Field 3 [Remove] |
+  // |      [New]       |
+  // |__________________|
+
+  // List fields have two lines for border characters, 1 line for the New
+  // button, and the total height of the available fields.
+  int FieldDelegateGetHeight() override {
+    // 2 border characters.
+    int height = 2;
+    for (int i = 0; i < GetNumberOfFields(); i++) {
+      height += m_fields[i].FieldDelegateGetHeight();
+    }
+    // Line for the New button.
+    height++;
+    return height;
+  }
+
+  void DrawRemoveButton(SubPad &surface, int highlight) {
+    surface.MoveCursor(1, surface.GetHeight() / 2);
+    if (highlight)
+      surface.AttributeOn(A_REVERSE);
+    surface.PutCString("[Remove]");
+    if (highlight)
+      surface.AttributeOff(A_REVERSE);
+  }
+
+  void DrawFields(SubPad &surface, bool is_selected) {
+    int line = 0;
+    int width = surface.GetWidth();
+    for (int i = 0; i < GetNumberOfFields(); i++) {
+      // Create subpads for drawing the field and the remove button.
+      int height = m_fields[i].FieldDelegateGetHeight();
+      Rect bounds = Rect(Point(0, line), Size(width, height));
+      Rect field_bounds, remove_button_bounds;
+      bounds.VerticalSplit(bounds.size.width - sizeof(" [Remove]"),
+                           field_bounds, remove_button_bounds);
+      SubPad field_surface = SubPad(surface, field_bounds);
+      SubPad remove_button_surface = SubPad(surface, remove_button_bounds);
+
+      bool is_element_selected = m_selected_field_index == i && is_selected;
+      bool is_field_selected =
+          is_element_selected && m_current_selection == Selected::Field;
+      bool is_remove_button_selected =
+          is_element_selected && m_current_selection == Selected::RemoveButton;
+      m_fields[i].FieldDelegateDraw(field_surface, is_field_selected);
+      DrawRemoveButton(remove_button_surface, is_remove_button_selected);
+
+      line += height;
+    }
+  }
+
+  void DrawNewButton(SubPad &surface, bool is_selected) {
+    const char *button_text = "[New]";
+    int x = (surface.GetWidth() - sizeof(button_text) - 1) / 2;
+    surface.MoveCursor(x, 0);
+    bool highlight = is_selected && m_current_selection == Selected::NewButton;
+    if (highlight)
+      surface.AttributeOn(A_REVERSE);
+    surface.PutCString(button_text);
+    if (highlight)
+      surface.AttributeOff(A_REVERSE);
+  }
+
+  void FieldDelegateDraw(SubPad &surface, bool is_selected) override {
+    // Draw label box.
+    surface.TitledBox(m_label.c_str());
+
+    // Create subpads for drawing the fields and the new button.
+    Rect content_bounds = surface.GetFrame();
+    content_bounds.Inset(1, 1);
+    Rect fields_bounds, new_button_bounds;
+    content_bounds.HorizontalSplit(content_bounds.size.height - 1,
+                                   fields_bounds, new_button_bounds);
+    SubPad fields_surface = SubPad(surface, fields_bounds);
+    SubPad new_button_surface = SubPad(surface, new_button_bounds);
+
+    DrawFields(fields_surface, is_selected);
+    DrawNewButton(new_button_surface, is_selected);
+  }
+
+  // Add new field and selected it.
+  void AddNewField() {
+    m_fields.push_back(m_default_field);
+    m_selected_field_index = GetNumberOfFields() - 1;
+    m_current_selection = Selected::Field;
+  }
+
+  // Remove the selected field and selected the previous field if it exists. If
+  // no fields exists, select the New button.
+  void RemoveField() {
+    m_fields.erase(m_fields.begin() + m_selected_field_index);
+    if (m_selected_field_index != 0)
+      m_selected_field_index--;
+    if (GetNumberOfFields() > 0)
+      m_current_selection = Selected::Field;
+    else
+      m_current_selection = Selected::NewButton;
+  }
+
+  // Select the next element. If a field is selected, select its remove button.
+  // If a remove button is selected, select the next field if it exists, or the
+  // new button if it doesn't exists. The case for the New button needn't be
+  // handled because the field will yield internal navigation at this point. See
+  // FieldDelegateYieldNavigation().
+  void SelectedNext() {
+    switch (m_current_selection) {
+    case Selected::Field:
+      m_current_selection = Selected::RemoveButton;
+      return;
+    case Selected::RemoveButton:
+      if (m_selected_field_index == GetNumberOfFields() - 1) {
+        m_selected_field_index = 0;
+        m_current_selection = Selected::NewButton;
+        return;
+      }
+      m_selected_field_index++;
+      m_current_selection = Selected::Field;
+      return;
+    default:
+      return;
+    }
+  }
+
+  HandleCharResult FieldDelegateHandleChar(int key) override {
+    switch (key) {
+    case '\r':
+    case '\n':
+    case KEY_ENTER:
+      switch (m_current_selection) {
+      case Selected::NewButton:
+        AddNewField();
+        return eKeyHandled;
+      case Selected::RemoveButton:
+        RemoveField();
+        return eKeyHandled;
+      default:
+        break;
+      }
+      break;
+    case '\t':
+      SelectedNext();
+      return eKeyHandled;
+    default:
+      break;
+    }
+
+    // If the key wasn't handled and one of the fields is selected, pass the key
+    // to that field.
+    if (m_current_selection == Selected::Field) {
+      return m_fields[m_selected_field_index].FieldDelegateHandleChar(key);
+    }
+
+    return eKeyNotHandled;
+  }
+
+  // Yield navigation if the New button is selected, and if so, select the first
+  // field if it exists. See FieldDelegateYieldNavigation().
+  bool FieldDelegateYieldNavigation() override {
+    if (m_current_selection == Selected::NewButton) {
+      if (GetNumberOfFields() != 0) {
+        m_selected_field_index = 0;
+        m_current_selection = Selected::Field;
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  int GetNumberOfFields() { return m_fields.size(); }
+
+  // Returns the form delegate at the current index.
+  T &GetField(int index) { return m_fields[index]; }
+
+protected:
+  std::string m_label;
+  // The default field delegate instance from which new field delegates will be
+  // created though a copy.
+  T m_default_field;
+  std::vector<T> m_fields;
+  int m_selected_field_index;
+  // Signifies which element is selected. See Selected class enum.
+  Selected m_current_selection;
+};
+
 class FormDelegate {
 public:
-  FormDelegate() : m_has_error(false), m_last_page_index(0) {}
+  FormDelegate() : m_has_error(false) {}
 
   virtual ~FormDelegate() = default;
 
@@ -1292,14 +1651,16 @@ public:
     return m_fields[selected_field_index]->FieldDelegateHandleChar(key);
   }
 
-  virtual void FormDelegateDraw(Window &window, int selected_field_index) {
-    int active_page_index = GetActivePageIndex(selected_field_index);
+  virtual void FormDelegateDraw(Pad &surface, int selected_field_index) {
+    int line = 0;
+    int width = surface.GetWidth();
     for (int i = 0; i < GetNumberOfFields(); i++) {
-      if (m_fields[i]->FieldDelegateGetPageIndex() != active_page_index)
-        continue;
-
       bool is_field_selected = selected_field_index == i;
-      m_fields[i]->FieldDelegateDraw(window, is_field_selected);
+      int height = m_fields[i]->FieldDelegateGetHeight();
+      Rect bounds = Rect(Point(0, line), Size(width, height));
+      SubPad field_surface = SubPad(surface, bounds);
+      m_fields[i]->FieldDelegateDraw(field_surface, is_field_selected);
+      line += height;
     }
   }
 
@@ -1307,74 +1668,111 @@ public:
   // method should set the m_error member to an appropriate error message.
   virtual bool FormDelegateSubmit() = 0;
 
+  // Get the total number of needed lines to draw all fields.
+  int GetTotalHeight() {
+    int height = 0;
+    for (int i = 0; i < GetNumberOfFields(); i++) {
+      height += m_fields[i]->FieldDelegateGetHeight();
+    }
+    return height;
+  }
+
+  // Get the index of the first line where the input field is drawn.
+  int GetFieldFirstLine(int field_index) {
+    int line = 0;
+    for (int i = 0; i < field_index; i++) {
+      line += m_fields[i]->FieldDelegateGetHeight();
+    }
+    return line;
+  }
+
+  // Get the index of the last line where the input field is drawn.
+  int GetFieldLastLine(int field_index) {
+    int line = 0;
+    for (int i = 0; i <= field_index; i++) {
+      line += m_fields[i]->FieldDelegateGetHeight();
+    }
+    return line - 1;
+  }
+
+  void ExitField(int field_index) {
+    m_fields[field_index]->FieldDelegateExitCallback();
+  }
+
+  bool YieldNavigation(int field_index) {
+    return m_fields[field_index]->FieldDelegateYieldNavigation();
+  }
+
   int GetNumberOfFields() { return m_fields.size(); }
 
   bool HasError() { return m_has_error; }
 
   std::string &GetError() { return m_error; }
 
-  // Return the index of the page that includes the selected field. If no field
-  // is selected, that is, if the selected field index is not in the correct
-  // range, return the last page index.
-  int GetActivePageIndex(int selected_field_index) {
-    if (selected_field_index < GetNumberOfFields())
-      return m_fields[selected_field_index]->FieldDelegateGetPageIndex();
-    return m_last_page_index;
-  }
-
-  int GetNumberOfPages() { return m_last_page_index + 1; }
-
   // Factory methods to create and add fields of specific types.
 
-  TextFieldDelegate *AddTextField(const char *label, int width, Point origin,
-                                  const char *content) {
-    TextFieldDelegate *delegate =
-        new TextFieldDelegate(label, width, origin, content);
+  TextFieldDelegate *AddTextField(const char *label, const char *content) {
+    TextFieldDelegate *delegate = new TextFieldDelegate(label, content);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
     m_fields.push_back(delegate_sp);
     return delegate;
   }
 
-  IntegerFieldDelegate *AddIntegerField(const char *label, int width,
-                                        Point origin, int content) {
-    IntegerFieldDelegate *delegate =
-        new IntegerFieldDelegate(label, width, origin, content);
+  FileFieldDelegate *AddFileField(const char *label, const char *content,
+                                  bool need_to_exist = true) {
+    FileFieldDelegate *delegate =
+        new FileFieldDelegate(label, content, need_to_exist);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
     m_fields.push_back(delegate_sp);
     return delegate;
   }
 
-  BooleanFieldDelegate *AddBooleanField(const char *label, Point origin,
-                                        bool content) {
-    BooleanFieldDelegate *delegate =
-        new BooleanFieldDelegate(label, origin, content);
+  DirectoryFieldDelegate *AddDirectoryField(const char *label,
+                                            const char *content,
+                                            bool need_to_exist = true) {
+    DirectoryFieldDelegate *delegate =
+        new DirectoryFieldDelegate(label, content, need_to_exist);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
     m_fields.push_back(delegate_sp);
     return delegate;
   }
 
-  ChoicesFieldDelegate *AddChoicesField(const char *label, int width,
-                                        int height, Point origin,
+  IntegerFieldDelegate *AddIntegerField(const char *label, int content) {
+    IntegerFieldDelegate *delegate = new IntegerFieldDelegate(label, content);
+    FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
+    m_fields.push_back(delegate_sp);
+    return delegate;
+  }
+
+  BooleanFieldDelegate *AddBooleanField(const char *label, bool content) {
+    BooleanFieldDelegate *delegate = new BooleanFieldDelegate(label, content);
+    FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
+    m_fields.push_back(delegate_sp);
+    return delegate;
+  }
+
+  ChoicesFieldDelegate *AddChoicesField(const char *label, int height,
                                         std::vector<std::string> choices) {
     ChoicesFieldDelegate *delegate =
-        new ChoicesFieldDelegate(label, width, height, origin, choices);
+        new ChoicesFieldDelegate(label, height, choices);
     FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
-    delegate_sp->FieldDelegateSetPageIndex(m_last_page_index);
     m_fields.push_back(delegate_sp);
     return delegate;
   }
 
-  void NewPage() { m_last_page_index++; }
+  template <class T>
+  ListFieldDelegate<T> *AddListField(const char *label, T default_field) {
+    ListFieldDelegate<T> *delegate =
+        new ListFieldDelegate<T>(label, default_field);
+    FieldDelegateSP delegate_sp = FieldDelegateSP(delegate);
+    m_fields.push_back(delegate_sp);
+    return delegate;
+  }
 
 protected:
   bool m_has_error;
   std::string m_error;
   std::vector<FieldDelegateSP> m_fields;
-  // The index of the last page.
-  int m_last_page_index;
 };
 
 typedef std::shared_ptr<FormDelegate> FormDelegateSP;
@@ -1382,23 +1780,20 @@ typedef std::shared_ptr<FormDelegate> FormDelegateSP;
 class FormWindowDelegate : public WindowDelegate {
 public:
   FormWindowDelegate(FormDelegateSP &delegate_sp)
-      : m_delegate_sp(delegate_sp), m_selected_field_index(0) {}
+      : m_delegate_sp(delegate_sp), m_selected_field_index(0),
+        m_first_visible_line(0) {}
 
   // A form window is divided into two sections. A body section which is padded
-  // by one character from every direction and contains the fields. The body can
-  // have multiple "pages" which are switched automatically as the user selects
-  // next fields. The number of pages is signified by a number of centered dots
-  // at the last line of the body section, the active page will have its dot
-  // highlighted. Additionally a footer section contains the submit button in
-  // one line and a possible error message in the next line. Finally, a
-  // horizontal line separates both sections.
+  // by one character from every direction and contains the fields. Additionally
+  // a footer section contains the submit button in one line and a possible
+  // error message in the next line. Finally, a horizontal line separates both
+  // sections.
   //
   // ___<Form Name>_________________________________________________
   // |                                                             |
   // |                                                             |
   // | Form elements here.                                         |
   // |                                                             |
-  // |                            ...                              |
   // |-------------------------------------------------------------|
   // |                         [ SUBMIT ]                          |
   // | Error message if it exists.                                 |
@@ -1406,45 +1801,43 @@ public:
   //
   // The following methods describe this structure in numbers.
 
-  int GetPageIndicatorYLocation(Window &window) {
-    return window.GetHeight() - 5;
-  }
+  int GetBodyHeight(Window &window) { return window.GetHeight() - 7; }
 
   int GetSeparatorYLocation(Window &window) { return window.GetHeight() - 4; }
 
   int GetButtonYLocation(Window &window) { return window.GetHeight() - 3; }
 
-  void DrawPageIndicators(Window &window) {
-    int number_of_pages = m_delegate_sp->GetNumberOfPages();
-    if (number_of_pages == 1) {
-      return;
-    }
-    int x = (window.GetWidth() - number_of_pages) / 2;
-    window.MoveCursor(x, GetPageIndicatorYLocation(window));
-    int active_page = m_delegate_sp->GetActivePageIndex(m_selected_field_index);
-    for (int i = 0; i < number_of_pages; i++) {
-      bool is_active = active_page == i;
-      if (is_active)
-        window.AttributeOn(A_REVERSE);
-      window.PutChar(ACS_BULLET);
-      if (is_active)
-        window.AttributeOff(A_REVERSE);
-    }
+  // Window is padded by one character from all sides and border characters
+  // exists on all sides. So dimensions are 4 characters less. Draw fields on a
+  // full pad first then copy to the window starting from the first visible
+  // line.
+  void DrawFieldElements(Window &window) {
+    int pad_height = m_delegate_sp->GetTotalHeight();
+    int pad_width = window.GetWidth() - 4;
+    Pad pad = Pad(Size(pad_width, pad_height));
+    m_delegate_sp->FormDelegateDraw(pad, m_selected_field_index);
+    pad.CopyToSurface(window, Point(0, m_first_visible_line), Point(2, 2),
+                      Size(pad_width, GetBodyHeight(window)));
+  }
+
+  // Scroll if needed.
+  void PrepareForDraw(Window &window) {
+    ScrollUpIfNeeded(window);
+    ScrollDownIfNeeded(window);
   }
 
   bool WindowDelegateDraw(Window &window, bool force) override {
+    PrepareForDraw(window);
+
     window.Erase();
 
     window.DrawTitleBox(window.GetName(), "Press Esc to cancel");
 
-    // Draw field elements.
-    m_delegate_sp->FormDelegateDraw(window, m_selected_field_index);
+    DrawFieldElements(window);
 
     // Draw a horizontal line separating the fields and the submit button.
     window.MoveCursor(1, GetSeparatorYLocation(window));
     window.HorizontalLine(window.GetWidth() - 2);
-
-    DrawPageIndicators(window);
 
     // Draw the centered submit button.
     const char *button_text = "[Submit]";
@@ -1469,9 +1862,44 @@ public:
     return true;
   }
 
+  int GetLastVisibleLine(Window &window) {
+    return m_first_visible_line + GetBodyHeight(window) - 1;
+  }
+
+  // If the last line in the selected field is larger than the last visible
+  // line, that means we need to scroll down, that is, increment the first
+  // visible line by the difference between the last field line and the last
+  // visible line.
+  void ScrollDownIfNeeded(Window &window) {
+    if (IsButtonActive())
+      return;
+
+    int last_field_line =
+        m_delegate_sp->GetFieldLastLine(m_selected_field_index);
+    int last_visible_line = GetLastVisibleLine(window);
+    if (last_field_line > last_visible_line) {
+      m_first_visible_line += last_field_line - last_visible_line;
+    }
+  }
+
+  // If the first line in the selected field is less than the first visible
+  // line, that means we need to scroll up, that is, set the first visible line
+  // to the first line of the selected field to make it fully visible.
+  void ScrollUpIfNeeded(Window &window) {
+    if (IsButtonActive())
+      return;
+
+    int first_line = m_delegate_sp->GetFieldFirstLine(m_selected_field_index);
+    if (first_line < m_first_visible_line) {
+      m_first_visible_line = first_line;
+    }
+  }
+
   // The index can be equal to the number of fields, hence the plus one. See
   // IsButtonActive().
   void SelectedNextField() {
+    if (!IsButtonActive())
+      m_delegate_sp->ExitField(m_selected_field_index);
     m_selected_field_index++;
     int number_of_fields = m_delegate_sp->GetNumberOfFields();
     m_selected_field_index %= number_of_fields + 1;
@@ -1494,6 +1922,9 @@ public:
       }
       break;
     case '\t':
+      if (!IsButtonActive() &&
+          !m_delegate_sp->YieldNavigation(m_selected_field_index))
+        break;
       SelectedNextField();
       return eKeyHandled;
     case KEY_ESCAPE:
@@ -1524,6 +1955,8 @@ protected:
   // The index of the selected field. This can be equal to the number of fields,
   // in which case, it denotes that the submit button is selected.
   int m_selected_field_index;
+  // The first visible line from the pad.
+  int m_first_visible_line;
 };
 
 class MenuDelegate {
