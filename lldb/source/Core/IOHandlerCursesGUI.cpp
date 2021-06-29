@@ -71,6 +71,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <type_traits>
 
 using namespace lldb;
@@ -84,6 +85,8 @@ using llvm::StringRef;
 
 #define KEY_RETURN 10
 #define KEY_ESCAPE 27
+
+#define KEY_SHIFT_TAB (KEY_MAX + 1)
 
 namespace curses {
 class Menu;
@@ -956,6 +959,20 @@ private:
   const Window &operator=(const Window &) = delete;
 };
 
+class DerivedWindow : public Surface {
+public:
+  DerivedWindow(Window &window, Rect bounds) {
+    m_window = ::derwin(window.get(), bounds.size.height, bounds.size.width,
+                        bounds.origin.y, bounds.origin.x);
+  }
+  DerivedWindow(DerivedWindow &derived_window, Rect bounds) {
+    m_window = ::derwin(derived_window.get(), bounds.size.height,
+                        bounds.size.width, bounds.origin.y, bounds.origin.x);
+  }
+
+  ~DerivedWindow() { ::delwin(m_window); }
+};
+
 /////////
 // Forms
 /////////
@@ -973,30 +990,40 @@ public:
   // is selected in the form window, then is_selected will be true.
   virtual void FieldDelegateDraw(SubPad &surface, bool is_selected) = 0;
 
-  // Handle the key that wasn't handled by the form window or a composing field.
-  // Navigation keys are treated specially, see FieldDelegateYieldNavigation().
+  // Handle the key that wasn't handled by the form window or a container field.
   virtual HandleCharResult FieldDelegateHandleChar(int key) {
     return eKeyNotHandled;
   }
 
   // This is executed once the user exists the field, that is, once the user
-  // navigates to the next field. This is particularly useful to do in-field
-  // validation and error setting.
+  // navigates to the next or the previous field. This is particularly useful to
+  // do in-field validation and error setting. Fields with internal navigation
+  // should call this method on their fields.
   virtual void FieldDelegateExitCallback() { return; }
 
-  // Fields may have internal navigation, for instance, a List Field need to
-  // handle the navigation keys to navigate its content when it is active (For
-  // instance, select the next field in the list when the tab key is pressed).
-  // To allow for this mechanism, the form window first calls this method on the
-  // active field, essentially asking the field to yield navigation to the
-  // window. The field may refuse by retuning false if it still needs to do
-  // internal navigation. Alternatively, the field may agree to yield navigation
-  // by retuning true, this is typically done when the last element in the field
-  // is selected. Additionally, the field may update its state accordingly, for
-  // instance, if the field is yielding, it may set its selected element to be
-  // the first one, such that when the window activates the element again, it
-  // becomes in a non-yielding state.
-  virtual bool FieldDelegateYieldNavigation() { return true; }
+  // Fields may have internal navigation, for instance, a List Field have
+  // multiple internal elements, which needs to be navigated. To allow for this
+  // mechanism, the window shouldn't handle the navigation keys all the time,
+  // and instead call the key handing method of the selected field. It should
+  // only handle the navigation keys when the field contains a single element or
+  // have the last or first element selected depending on if the user is
+  // navigating forward or backward. Additionally, once a field is selected in
+  // the forward or backward direction, its first or last internal element
+  // should be selected. The following methods implements those mechanisms.
+
+  // Returns true if the first element in the field is selected or if the field
+  // contains a single element.
+  virtual bool FieldDelegateOnFirstOrOnlyElement() { return true; }
+
+  // Returns true if the last element in the field is selected or if the field
+  // contains a single element.
+  virtual bool FieldDelegateOnLastOrOnlyElement() { return true; }
+
+  // Select the first element in the field if multiple elements exists.
+  virtual void FieldDelegateSelectFirstElement() { return; }
+
+  // Select the last element in the field if multiple elements exists.
+  virtual void FieldDelegateSelectLastElement() { return; }
 };
 
 typedef std::shared_ptr<FieldDelegate> FieldDelegateSP;
@@ -1055,10 +1082,8 @@ public:
   }
 
   void DrawField(SubPad &surface, bool is_selected) {
-    // Draw label box.
     surface.TitledBox(m_label.c_str());
 
-    // Create subpad for drawing content.
     Rect content_bounds = surface.GetFrame();
     content_bounds.Inset(1, 1);
     SubPad content_surface = SubPad(surface, content_bounds);
@@ -1078,7 +1103,6 @@ public:
   }
 
   void FieldDelegateDraw(SubPad &surface, bool is_selected) override {
-    // Create subpads for drawing the field and possibly the error message.
     Rect frame = surface.GetFrame();
     Rect field_bounds, error_bounds;
     frame.HorizontalSplit(GetFieldHeight(), field_bounds, error_bounds);
@@ -1371,10 +1395,8 @@ public:
   }
 
   void FieldDelegateDraw(SubPad &surface, bool is_selected) override {
-    // Draw label box.
     surface.TitledBox(m_label.c_str());
 
-    // Create subpad for drawing content.
     Rect content_bounds = surface.GetFrame();
     content_bounds.Inset(1, 1);
     SubPad content_surface = SubPad(surface, content_bounds);
@@ -1441,13 +1463,15 @@ protected:
 template <class T> class ListFieldDelegate : public FieldDelegate {
 public:
   ListFieldDelegate(const char *label, T default_field)
-      : m_label(label), m_default_field(default_field),
-        m_selected_field_index(0), m_current_selection(Selected::NewButton) {}
+      : m_label(label), m_default_field(default_field), m_selection_index(0),
+        m_selection_type(SelectionType::NewButton) {}
 
-  // Signify which element is selected.
-  enum class Selected { Field, RemoveButton, NewButton };
+  // Signify which element is selected. If a field or a remove button is
+  // selected, then m_selection_index signifies the particular field that
+  // is selected or the field that the remove button belongs to.
+  enum class SelectionType { Field, RemoveButton, NewButton };
 
-  // List fields are drawn as titles boxses of a number of other fields of the
+  // A List field is drawn as a titled box of a number of other fields of the
   // same type. Each field has a Remove button next to it that removes the
   // corresponding field. Finally, the last line contains a New button to add a
   // new field.
@@ -1464,10 +1488,11 @@ public:
   int FieldDelegateGetHeight() override {
     // 2 border characters.
     int height = 2;
+    // Total height of the fields.
     for (int i = 0; i < GetNumberOfFields(); i++) {
       height += m_fields[i].FieldDelegateGetHeight();
     }
-    // Line for the New button.
+    // A line for the New button.
     height++;
     return height;
   }
@@ -1485,7 +1510,6 @@ public:
     int line = 0;
     int width = surface.GetWidth();
     for (int i = 0; i < GetNumberOfFields(); i++) {
-      // Create subpads for drawing the field and the remove button.
       int height = m_fields[i].FieldDelegateGetHeight();
       Rect bounds = Rect(Point(0, line), Size(width, height));
       Rect field_bounds, remove_button_bounds;
@@ -1494,11 +1518,12 @@ public:
       SubPad field_surface = SubPad(surface, field_bounds);
       SubPad remove_button_surface = SubPad(surface, remove_button_bounds);
 
-      bool is_element_selected = m_selected_field_index == i && is_selected;
+      bool is_element_selected = m_selection_index == i && is_selected;
       bool is_field_selected =
-          is_element_selected && m_current_selection == Selected::Field;
+          is_element_selected && m_selection_type == SelectionType::Field;
       bool is_remove_button_selected =
-          is_element_selected && m_current_selection == Selected::RemoveButton;
+          is_element_selected &&
+          m_selection_type == SelectionType::RemoveButton;
       m_fields[i].FieldDelegateDraw(field_surface, is_field_selected);
       DrawRemoveButton(remove_button_surface, is_remove_button_selected);
 
@@ -1510,7 +1535,8 @@ public:
     const char *button_text = "[New]";
     int x = (surface.GetWidth() - sizeof(button_text) - 1) / 2;
     surface.MoveCursor(x, 0);
-    bool highlight = is_selected && m_current_selection == Selected::NewButton;
+    bool highlight =
+        is_selected && m_selection_type == SelectionType::NewButton;
     if (highlight)
       surface.AttributeOn(A_REVERSE);
     surface.PutCString(button_text);
@@ -1519,10 +1545,8 @@ public:
   }
 
   void FieldDelegateDraw(SubPad &surface, bool is_selected) override {
-    // Draw label box.
     surface.TitledBox(m_label.c_str());
 
-    // Create subpads for drawing the fields and the new button.
     Rect content_bounds = surface.GetFrame();
     content_bounds.Inset(1, 1);
     Rect fields_bounds, new_button_bounds;
@@ -1535,47 +1559,81 @@ public:
     DrawNewButton(new_button_surface, is_selected);
   }
 
-  // Add new field and selected it.
   void AddNewField() {
     m_fields.push_back(m_default_field);
-    m_selected_field_index = GetNumberOfFields() - 1;
-    m_current_selection = Selected::Field;
+    m_selection_index = GetNumberOfFields() - 1;
+    m_selection_type = SelectionType::Field;
+    FieldDelegate &field = m_fields[m_selection_index];
+    field.FieldDelegateSelectFirstElement();
   }
 
-  // Remove the selected field and selected the previous field if it exists. If
-  // no fields exists, select the New button.
   void RemoveField() {
-    m_fields.erase(m_fields.begin() + m_selected_field_index);
-    if (m_selected_field_index != 0)
-      m_selected_field_index--;
-    if (GetNumberOfFields() > 0)
-      m_current_selection = Selected::Field;
-    else
-      m_current_selection = Selected::NewButton;
+    m_fields.erase(m_fields.begin() + m_selection_index);
+    if (m_selection_index != 0)
+      m_selection_index--;
+
+    if (GetNumberOfFields() > 0) {
+      m_selection_type = SelectionType::Field;
+      FieldDelegate &field = m_fields[m_selection_index];
+      field.FieldDelegateSelectFirstElement();
+    } else
+      m_selection_type = SelectionType::NewButton;
   }
 
-  // Select the next element. If a field is selected, select its remove button.
-  // If a remove button is selected, select the next field if it exists, or the
-  // new button if it doesn't exists. The case for the New button needn't be
-  // handled because the field will yield internal navigation at this point. See
-  // FieldDelegateYieldNavigation().
-  void SelectedNext() {
-    switch (m_current_selection) {
-    case Selected::Field:
-      m_current_selection = Selected::RemoveButton;
-      return;
-    case Selected::RemoveButton:
-      if (m_selected_field_index == GetNumberOfFields() - 1) {
-        m_selected_field_index = 0;
-        m_current_selection = Selected::NewButton;
-        return;
+  HandleCharResult SelecteNext(int key) {
+    if (m_selection_type == SelectionType::NewButton)
+      return eKeyNotHandled;
+
+    if (m_selection_type == SelectionType::RemoveButton) {
+      if (m_selection_index == GetNumberOfFields() - 1) {
+        m_selection_type = SelectionType::NewButton;
+        return eKeyHandled;
       }
-      m_selected_field_index++;
-      m_current_selection = Selected::Field;
-      return;
-    default:
-      return;
+      m_selection_index++;
+      m_selection_type = SelectionType::Field;
+      FieldDelegate &next_field = m_fields[m_selection_index];
+      next_field.FieldDelegateSelectFirstElement();
+      return eKeyHandled;
     }
+
+    FieldDelegate &field = m_fields[m_selection_index];
+    if (!field.FieldDelegateOnLastOrOnlyElement()) {
+      return field.FieldDelegateHandleChar(key);
+    }
+
+    field.FieldDelegateExitCallback();
+
+    m_selection_type = SelectionType::RemoveButton;
+    return eKeyHandled;
+  }
+
+  HandleCharResult SelectPrevious(int key) {
+    if (FieldDelegateOnFirstOrOnlyElement())
+      return eKeyNotHandled;
+
+    if (m_selection_type == SelectionType::RemoveButton) {
+      m_selection_type = SelectionType::Field;
+      FieldDelegate &field = m_fields[m_selection_index];
+      field.FieldDelegateSelectLastElement();
+      return eKeyHandled;
+    }
+
+    if (m_selection_type == SelectionType::NewButton) {
+      m_selection_type = SelectionType::RemoveButton;
+      m_selection_index = GetNumberOfFields() - 1;
+      return eKeyHandled;
+    }
+
+    FieldDelegate &field = m_fields[m_selection_index];
+    if (!field.FieldDelegateOnFirstOrOnlyElement()) {
+      return field.FieldDelegateHandleChar(key);
+    }
+
+    field.FieldDelegateExitCallback();
+
+    m_selection_type = SelectionType::RemoveButton;
+    m_selection_index--;
+    return eKeyHandled;
   }
 
   HandleCharResult FieldDelegateHandleChar(int key) override {
@@ -1583,11 +1641,11 @@ public:
     case '\r':
     case '\n':
     case KEY_ENTER:
-      switch (m_current_selection) {
-      case Selected::NewButton:
+      switch (m_selection_type) {
+      case SelectionType::NewButton:
         AddNewField();
         return eKeyHandled;
-      case Selected::RemoveButton:
+      case SelectionType::RemoveButton:
         RemoveField();
         return eKeyHandled;
       default:
@@ -1595,7 +1653,10 @@ public:
       }
       break;
     case '\t':
-      SelectedNext();
+      SelecteNext(key);
+      return eKeyHandled;
+    case KEY_SHIFT_TAB:
+      SelectPrevious(key);
       return eKeyHandled;
     default:
       break;
@@ -1603,25 +1664,46 @@ public:
 
     // If the key wasn't handled and one of the fields is selected, pass the key
     // to that field.
-    if (m_current_selection == Selected::Field) {
-      return m_fields[m_selected_field_index].FieldDelegateHandleChar(key);
+    if (m_selection_type == SelectionType::Field) {
+      return m_fields[m_selection_index].FieldDelegateHandleChar(key);
     }
 
     return eKeyNotHandled;
   }
 
-  // Yield navigation if the New button is selected, and if so, select the first
-  // field if it exists. See FieldDelegateYieldNavigation().
-  bool FieldDelegateYieldNavigation() override {
-    if (m_current_selection == Selected::NewButton) {
-      if (GetNumberOfFields() != 0) {
-        m_selected_field_index = 0;
-        m_current_selection = Selected::Field;
-      }
+  bool FieldDelegateOnLastOrOnlyElement() override {
+    if (m_selection_type == SelectionType::NewButton) {
       return true;
+    }
+    return false;
+  }
+
+  bool FieldDelegateOnFirstOrOnlyElement() override {
+    if (m_selection_type == SelectionType::NewButton &&
+        GetNumberOfFields() == 0)
+      return true;
+
+    if (m_selection_type == SelectionType::Field && m_selection_index == 0) {
+      FieldDelegate &field = m_fields[m_selection_index];
+      return field.FieldDelegateOnFirstOrOnlyElement();
     }
 
     return false;
+  }
+
+  void FieldDelegateSelectFirstElement() override {
+    if (GetNumberOfFields() == 0) {
+      m_selection_type = SelectionType::NewButton;
+      return;
+    }
+
+    m_selection_type = SelectionType::Field;
+    m_selection_index = 0;
+  }
+
+  void FieldDelegateSelectLastElement() override {
+    m_selection_type = SelectionType::NewButton;
+    return;
   }
 
   int GetNumberOfFields() { return m_fields.size(); }
@@ -1635,79 +1717,62 @@ protected:
   // created though a copy.
   T m_default_field;
   std::vector<T> m_fields;
-  int m_selected_field_index;
-  // Signifies which element is selected. See Selected class enum.
-  Selected m_current_selection;
+  int m_selection_index;
+  // See SelectionType class enum.
+  SelectionType m_selection_type;
+};
+
+class FormAction {
+public:
+  FormAction(const char *label, std::function<void(Window &)> action)
+      : m_action(action) {
+    if (label)
+      m_label = label;
+  }
+
+  // Draw a centered [Label].
+  void Draw(SubPad &surface, bool is_selected) {
+    int x = (surface.GetWidth() - m_label.length()) / 2;
+    surface.MoveCursor(x, 0);
+    if (is_selected)
+      surface.AttributeOn(A_REVERSE);
+    surface.PutChar('[');
+    surface.PutCString(m_label.c_str());
+    surface.PutChar(']');
+    if (is_selected)
+      surface.AttributeOff(A_REVERSE);
+  }
+
+  void Execute(Window &window) { m_action(window); }
+
+  const std::string &GetLabel() { return m_label; }
+
+protected:
+  std::string m_label;
+  std::function<void(Window &)> m_action;
 };
 
 class FormDelegate {
 public:
-  FormDelegate() : m_has_error(false) {}
+  FormDelegate() {}
 
   virtual ~FormDelegate() = default;
 
-  virtual HandleCharResult FormDelegateHandleChar(int selected_field_index,
-                                                  int key) {
-    return m_fields[selected_field_index]->FieldDelegateHandleChar(key);
-  }
+  FieldDelegateSP &GetField(int field_index) { return m_fields[field_index]; }
 
-  virtual void FormDelegateDraw(Pad &surface, int selected_field_index) {
-    int line = 0;
-    int width = surface.GetWidth();
-    for (int i = 0; i < GetNumberOfFields(); i++) {
-      bool is_field_selected = selected_field_index == i;
-      int height = m_fields[i]->FieldDelegateGetHeight();
-      Rect bounds = Rect(Point(0, line), Size(width, height));
-      SubPad field_surface = SubPad(surface, bounds);
-      m_fields[i]->FieldDelegateDraw(field_surface, is_field_selected);
-      line += height;
-    }
-  }
-
-  // Return true if submission was successful, false otherwise. If false, the
-  // method should set the m_error member to an appropriate error message.
-  virtual bool FormDelegateSubmit() = 0;
-
-  // Get the total number of needed lines to draw all fields.
-  int GetTotalHeight() {
-    int height = 0;
-    for (int i = 0; i < GetNumberOfFields(); i++) {
-      height += m_fields[i]->FieldDelegateGetHeight();
-    }
-    return height;
-  }
-
-  // Get the index of the first line where the input field is drawn.
-  int GetFieldFirstLine(int field_index) {
-    int line = 0;
-    for (int i = 0; i < field_index; i++) {
-      line += m_fields[i]->FieldDelegateGetHeight();
-    }
-    return line;
-  }
-
-  // Get the index of the last line where the input field is drawn.
-  int GetFieldLastLine(int field_index) {
-    int line = 0;
-    for (int i = 0; i <= field_index; i++) {
-      line += m_fields[i]->FieldDelegateGetHeight();
-    }
-    return line - 1;
-  }
-
-  void ExitField(int field_index) {
-    m_fields[field_index]->FieldDelegateExitCallback();
-  }
-
-  bool YieldNavigation(int field_index) {
-    return m_fields[field_index]->FieldDelegateYieldNavigation();
-  }
+  FormAction &GetAction(int action_index) { return m_actions[action_index]; }
 
   int GetNumberOfFields() { return m_fields.size(); }
 
-  bool HasError() { return m_has_error; }
+  int GetNumberOfActions() { return m_actions.size(); }
 
-  std::string &GetError() { return m_error; }
+  bool HasError() { return !m_error.empty(); }
+
+  void ClearError() { m_error.clear(); }
+
+  const std::string &GetError() { return m_error; }
+
+  void SetError(const char *error) { m_error = error; }
 
   // Factory methods to create and add fields of specific types.
 
@@ -1769,10 +1834,17 @@ public:
     return delegate;
   }
 
+  // Factory methods for adding actions.
+
+  void AddAction(const char *label, std::function<void(Window &)> action) {
+    m_actions.push_back(FormAction(label, action));
+  }
+
 protected:
-  bool m_has_error;
-  std::string m_error;
   std::vector<FieldDelegateSP> m_fields;
+  std::vector<FormAction> m_actions;
+  // Optional error message. If empty, form is considered to have no error.
+  std::string m_error;
 };
 
 typedef std::shared_ptr<FormDelegate> FormDelegateSP;
@@ -1780,135 +1852,216 @@ typedef std::shared_ptr<FormDelegate> FormDelegateSP;
 class FormWindowDelegate : public WindowDelegate {
 public:
   FormWindowDelegate(FormDelegateSP &delegate_sp)
-      : m_delegate_sp(delegate_sp), m_selected_field_index(0),
-        m_first_visible_line(0) {}
+      : m_delegate_sp(delegate_sp), m_selection_index(0),
+        m_selection_type(SelectionType::Field), m_first_visible_line(0) {}
 
-  // A form window is divided into two sections. A body section which is padded
-  // by one character from every direction and contains the fields. Additionally
-  // a footer section contains the submit button in one line and a possible
-  // error message in the next line. Finally, a horizontal line separates both
-  // sections.
+  // Signify which element is selected. If a field or an action is selected,
+  // then m_selection_index signifies the particular field or action that is
+  // selected.
+  enum class SelectionType { Field, Action };
+
+  // A form window is padded by one character from all sides. First, if an error
+  // message exists, it is drawn followed by a separator. Then one or more
+  // fields are drawn. Finally, all available actions are drawn on a single
+  // line.
   //
   // ___<Form Name>_________________________________________________
   // |                                                             |
-  // |                                                             |
-  // | Form elements here.                                         |
-  // |                                                             |
+  // | - Error message if it exists.                               |
   // |-------------------------------------------------------------|
-  // |                         [ SUBMIT ]                          |
-  // | Error message if it exists.                                 |
+  // | Form elements here.                                         |
+  // |                       Form actions here.                    |
+  // |                                                             |
   // |______________________________________[Press Esc to cancel]__|
   //
-  // The following methods describe this structure in numbers.
 
-  int GetBodyHeight(Window &window) { return window.GetHeight() - 7; }
-
-  int GetSeparatorYLocation(Window &window) { return window.GetHeight() - 4; }
-
-  int GetButtonYLocation(Window &window) { return window.GetHeight() - 3; }
-
-  // Window is padded by one character from all sides and border characters
-  // exists on all sides. So dimensions are 4 characters less. Draw fields on a
-  // full pad first then copy to the window starting from the first visible
-  // line.
-  void DrawFieldElements(Window &window) {
-    int pad_height = m_delegate_sp->GetTotalHeight();
-    int pad_width = window.GetWidth() - 4;
-    Pad pad = Pad(Size(pad_width, pad_height));
-    m_delegate_sp->FormDelegateDraw(pad, m_selected_field_index);
-    pad.CopyToSurface(window, Point(0, m_first_visible_line), Point(2, 2),
-                      Size(pad_width, GetBodyHeight(window)));
+  // One line for the error and another for the horizontal line.
+  int GetErrorHeight() {
+    if (m_delegate_sp->HasError())
+      return 2;
+    return 0;
   }
 
-  // Scroll if needed.
-  void PrepareForDraw(Window &window) {
-    ScrollUpIfNeeded(window);
-    ScrollDownIfNeeded(window);
+  // Actions span a single line.
+  int GetActionsHeight() {
+    if (m_delegate_sp->GetNumberOfActions() > 0)
+      return 1;
+    return 0;
+  }
+
+  // Get the total number of needed lines to draw the contents.
+  int GetContentHeight() {
+    int height = 0;
+    height += GetErrorHeight();
+    for (int i = 0; i < m_delegate_sp->GetNumberOfFields(); i++) {
+      height += m_delegate_sp->GetField(i)->FieldDelegateGetHeight();
+    }
+    height += GetActionsHeight();
+    return height;
+  }
+
+  void DrawError(SubPad &surface) {
+    if (!m_delegate_sp->HasError())
+      return;
+    surface.MoveCursor(0, 0);
+    surface.AttributeOn(COLOR_PAIR(RedOnBlack));
+    surface.PutChar(ACS_DIAMOND);
+    surface.PutChar(' ');
+    surface.PutCStringTruncated(1, m_delegate_sp->GetError().c_str());
+    surface.AttributeOff(COLOR_PAIR(RedOnBlack));
+
+    surface.MoveCursor(0, 1);
+    surface.HorizontalLine(surface.GetWidth());
+  }
+
+  void DrawFields(SubPad &surface) {
+    int line = 0;
+    int width = surface.GetWidth();
+    bool a_field_is_selected = m_selection_type == SelectionType::Field;
+    for (int i = 0; i < m_delegate_sp->GetNumberOfFields(); i++) {
+      bool is_field_selected = a_field_is_selected && m_selection_index == i;
+      FieldDelegateSP &field = m_delegate_sp->GetField(i);
+      int height = field->FieldDelegateGetHeight();
+      Rect bounds = Rect(Point(0, line), Size(width, height));
+      SubPad field_surface = SubPad(surface, bounds);
+      field->FieldDelegateDraw(field_surface, is_field_selected);
+      line += height;
+    }
+  }
+
+  void DrawActions(SubPad &surface) {
+    int number_of_actions = m_delegate_sp->GetNumberOfActions();
+    int width = surface.GetWidth() / number_of_actions;
+    bool an_action_is_selected = m_selection_type == SelectionType::Action;
+    int x = 0;
+    for (int i = 0; i < number_of_actions; i++) {
+      bool is_action_selected = an_action_is_selected && m_selection_index == i;
+      FormAction &action = m_delegate_sp->GetAction(i);
+      Rect bounds = Rect(Point(x, 0), Size(width, 1));
+      SubPad action_surface = SubPad(surface, bounds);
+      action.Draw(action_surface, is_action_selected);
+      x += width;
+    }
+  }
+
+  void DrawElements(SubPad &surface) {
+    Rect frame = surface.GetFrame();
+    Rect fields_bounds, actions_bounds;
+    frame.HorizontalSplit(surface.GetHeight() - GetActionsHeight(),
+                          fields_bounds, actions_bounds);
+    SubPad fields_surface = SubPad(surface, fields_bounds);
+    SubPad actions_surface = SubPad(surface, actions_bounds);
+
+    DrawFields(fields_surface);
+    DrawActions(actions_surface);
+  }
+
+  void DrawContent(DerivedWindow &surface) {
+    int width = surface.GetWidth();
+    int height = GetContentHeight();
+    Pad pad = Pad(Size(width, height));
+
+    Rect frame = pad.GetFrame();
+    Rect error_bounds, elements_bounds;
+    frame.HorizontalSplit(GetErrorHeight(), error_bounds, elements_bounds);
+    SubPad error_surface = SubPad(pad, error_bounds);
+    SubPad elements_surface = SubPad(pad, elements_bounds);
+
+    DrawError(error_surface);
+    DrawElements(error_surface);
+
+    int copy_height = std::min(surface.GetHeight(), pad.GetHeight());
+    pad.CopyToSurface(surface, Point(0, m_first_visible_line), Point(),
+                      Size(width, copy_height));
   }
 
   bool WindowDelegateDraw(Window &window, bool force) override {
-    PrepareForDraw(window);
-
     window.Erase();
 
     window.DrawTitleBox(window.GetName(), "Press Esc to cancel");
 
-    DrawFieldElements(window);
+    Rect content_bounds = window.GetFrame();
+    content_bounds.Inset(2, 2);
+    DerivedWindow content_surface = DerivedWindow(window, content_bounds);
 
-    // Draw a horizontal line separating the fields and the submit button.
-    window.MoveCursor(1, GetSeparatorYLocation(window));
-    window.HorizontalLine(window.GetWidth() - 2);
-
-    // Draw the centered submit button.
-    const char *button_text = "[Submit]";
-    int x = (window.GetWidth() - sizeof(button_text) - 1) / 2;
-    window.MoveCursor(x, GetButtonYLocation(window));
-    if (IsButtonActive())
-      window.AttributeOn(A_REVERSE);
-    window.PutCString(button_text);
-    if (IsButtonActive())
-      window.AttributeOff(A_REVERSE);
-
-    // Draw the error if it exists.
-    if (m_delegate_sp->HasError()) {
-      window.MoveCursor(2, window.GetHeight() - 2);
-      window.AttributeOn(COLOR_PAIR(RedOnBlack));
-      window.PutChar(ACS_DIAMOND);
-      window.PutChar(' ');
-      window.PutCStringTruncated(1, m_delegate_sp->GetError().c_str());
-      window.AttributeOff(COLOR_PAIR(RedOnBlack));
-    }
-
+    DrawContent(content_surface);
     return true;
   }
 
-  int GetLastVisibleLine(Window &window) {
-    return m_first_visible_line + GetBodyHeight(window) - 1;
-  }
+  HandleCharResult SelecteNext(int key) {
+    if (m_selection_type == SelectionType::Action) {
+      if (m_selection_index < m_delegate_sp->GetNumberOfActions() - 1) {
+        m_selection_index++;
+        return eKeyHandled;
+      }
 
-  // If the last line in the selected field is larger than the last visible
-  // line, that means we need to scroll down, that is, increment the first
-  // visible line by the difference between the last field line and the last
-  // visible line.
-  void ScrollDownIfNeeded(Window &window) {
-    if (IsButtonActive())
-      return;
-
-    int last_field_line =
-        m_delegate_sp->GetFieldLastLine(m_selected_field_index);
-    int last_visible_line = GetLastVisibleLine(window);
-    if (last_field_line > last_visible_line) {
-      m_first_visible_line += last_field_line - last_visible_line;
+      m_selection_index = 0;
+      m_selection_type = SelectionType::Field;
+      FieldDelegateSP &next_field = m_delegate_sp->GetField(m_selection_index);
+      next_field->FieldDelegateSelectFirstElement();
+      return eKeyHandled;
     }
-  }
 
-  // If the first line in the selected field is less than the first visible
-  // line, that means we need to scroll up, that is, set the first visible line
-  // to the first line of the selected field to make it fully visible.
-  void ScrollUpIfNeeded(Window &window) {
-    if (IsButtonActive())
-      return;
-
-    int first_line = m_delegate_sp->GetFieldFirstLine(m_selected_field_index);
-    if (first_line < m_first_visible_line) {
-      m_first_visible_line = first_line;
+    FieldDelegateSP &field = m_delegate_sp->GetField(m_selection_index);
+    if (!field->FieldDelegateOnLastOrOnlyElement()) {
+      return field->FieldDelegateHandleChar(key);
     }
+
+    field->FieldDelegateExitCallback();
+
+    if (m_selection_index == m_delegate_sp->GetNumberOfFields() - 1) {
+      m_selection_type = SelectionType::Action;
+      m_selection_index = 0;
+      return eKeyHandled;
+    }
+
+    m_selection_index++;
+
+    FieldDelegateSP &next_field = m_delegate_sp->GetField(m_selection_index);
+    next_field->FieldDelegateSelectFirstElement();
+
+    return eKeyHandled;
   }
 
-  // The index can be equal to the number of fields, hence the plus one. See
-  // IsButtonActive().
-  void SelectedNextField() {
-    if (!IsButtonActive())
-      m_delegate_sp->ExitField(m_selected_field_index);
-    m_selected_field_index++;
-    int number_of_fields = m_delegate_sp->GetNumberOfFields();
-    m_selected_field_index %= number_of_fields + 1;
+  HandleCharResult SelectePrevious(int key) {
+    if (m_selection_type == SelectionType::Action) {
+      if (m_selection_index > 0) {
+        m_selection_index--;
+        return eKeyHandled;
+      }
+      m_selection_index = m_delegate_sp->GetNumberOfFields() - 1;
+      m_selection_type = SelectionType::Field;
+      FieldDelegateSP &previous_field =
+          m_delegate_sp->GetField(m_selection_index);
+      previous_field->FieldDelegateSelectLastElement();
+      return eKeyHandled;
+    }
+
+    FieldDelegateSP &field = m_delegate_sp->GetField(m_selection_index);
+    if (!field->FieldDelegateOnFirstOrOnlyElement()) {
+      return field->FieldDelegateHandleChar(key);
+    }
+
+    field->FieldDelegateExitCallback();
+
+    if (m_selection_index == 0) {
+      m_selection_type = SelectionType::Action;
+      m_selection_index = m_delegate_sp->GetNumberOfActions() - 1;
+      return eKeyHandled;
+    }
+
+    m_selection_index--;
+
+    FieldDelegateSP &previous_field =
+        m_delegate_sp->GetField(m_selection_index);
+    previous_field->FieldDelegateSelectLastElement();
+
+    return eKeyHandled;
   }
 
-  void SubmitForm(Window &window) {
-    bool is_successful = m_delegate_sp->FormDelegateSubmit();
-    if (is_successful)
-      window.GetParent()->RemoveSubWindow(&window);
+  void ExecuteAction(Window &window) {
+    FormAction &action = m_delegate_sp->GetAction(m_selection_index);
+    action.Execute(window);
   }
 
   HandleCharResult WindowDelegateHandleChar(Window &window, int key) override {
@@ -1916,17 +2069,15 @@ public:
     case '\r':
     case '\n':
     case KEY_ENTER:
-      if (IsButtonActive()) {
-        SubmitForm(window);
+      if (m_selection_type == SelectionType::Action) {
+        ExecuteAction(window);
         return eKeyHandled;
       }
       break;
     case '\t':
-      if (!IsButtonActive() &&
-          !m_delegate_sp->YieldNavigation(m_selected_field_index))
-        break;
-      SelectedNextField();
-      return eKeyHandled;
+      return SelecteNext(key);
+    case KEY_SHIFT_TAB:
+      return SelectePrevious(key);
     case KEY_ESCAPE:
       window.GetParent()->RemoveSubWindow(&window);
       return eKeyHandled;
@@ -1934,27 +2085,22 @@ public:
       break;
     }
 
-    // If the key wasn't handled and one of the fields is active, pass the key
+    // If the key wasn't handled and one of the fields is selected, pass the key
     // to that field.
-    if (!IsButtonActive()) {
-      return m_delegate_sp->FormDelegateHandleChar(m_selected_field_index, key);
+    if (m_selection_type == SelectionType::Field) {
+      FieldDelegateSP &field = m_delegate_sp->GetField(m_selection_index);
+      return field->FieldDelegateHandleChar(key);
     }
 
     return eKeyNotHandled;
   }
 
-  // When the selected field index is equal to the number of selected fields,
-  // this denotes that the submit button is selected.
-  bool IsButtonActive() {
-    int number_of_fields = m_delegate_sp->GetNumberOfFields();
-    return m_selected_field_index == number_of_fields;
-  }
-
 protected:
   FormDelegateSP m_delegate_sp;
-  // The index of the selected field. This can be equal to the number of fields,
-  // in which case, it denotes that the submit button is selected.
-  int m_selected_field_index;
+  // The index of the currently selected SelectionType.
+  int m_selection_index;
+  // See SelectionType class enum.
+  SelectionType m_selection_type;
   // The first visible line from the pad.
   int m_first_visible_line;
 };
@@ -4128,7 +4274,7 @@ public:
       window.SelectNextWindowAsActive();
       return eKeyHandled;
 
-    case KEY_BTAB:
+    case KEY_SHIFT_TAB:
       window.SelectPreviousWindowAsActive();
       return eKeyHandled;
 
@@ -5425,6 +5571,8 @@ void IOHandlerCursesGUI::Activate() {
     init_pair(17, COLOR_BLACK, COLOR_WHITE);
     init_pair(18, COLOR_MAGENTA, COLOR_WHITE);
     static_assert(LastColorPairIndex == 18, "Color indexes do not match.");
+
+    define_key("\033[Z", KEY_SHIFT_TAB);
   }
 }
 
