@@ -977,6 +977,23 @@ public:
 // Forms
 /////////
 
+// A scroll context defines a vertical region that needs to be visible in a
+// scrolling area. The region is defined by the index of the start and end lines
+// of the region. The start and end lines may be equal, in which case, the
+// region is a single line.
+struct ScrollContext {
+  int start;
+  int end;
+
+  ScrollContext(int line) : start(line), end(line) {}
+  ScrollContext(int _start, int _end) : start(_start), end(_end) {}
+
+  void Offset(int offset) {
+    start += offset;
+    end += offset;
+  }
+};
+
 class FieldDelegate {
 public:
   virtual ~FieldDelegate() = default;
@@ -984,6 +1001,15 @@ public:
   // Returns the number of lines needed to draw the field. The draw method will
   // be given a surface that have exactly this number of lines.
   virtual int FieldDelegateGetHeight() = 0;
+
+  // Returns the scroll context in the local coordinates of the field. By
+  // default, the scroll context spans the whole field. Bigger fields with
+  // internal navigation should override this method to provide a finer context.
+  // Typical override methods would first get the scroll context of the internal
+  // element then add the offset of the element in the field.
+  virtual ScrollContext FieldDelegateGetScrollContext() {
+    return ScrollContext(0, FieldDelegateGetHeight() - 1);
+  }
 
   // Draw the field in the given subpad surface. The surface have a height that
   // is equal to the height returned by FieldDelegateGetHeight(). If the field
@@ -1477,9 +1503,9 @@ public:
   // new field.
   //
   // __[Label]___________
+  // | Field 0 [Remove] |
   // | Field 1 [Remove] |
   // | Field 2 [Remove] |
-  // | Field 3 [Remove] |
   // |      [New]       |
   // |__________________|
 
@@ -1495,6 +1521,34 @@ public:
     // A line for the New button.
     height++;
     return height;
+  }
+
+  ScrollContext FieldDelegateGetScrollContext() override {
+    int height = FieldDelegateGetHeight();
+    if (m_selection_type == SelectionType::NewButton)
+      return ScrollContext(height - 2, height - 1);
+
+    FieldDelegate &field = m_fields[m_selection_index];
+    ScrollContext context = field.FieldDelegateGetScrollContext();
+
+    // Start at 1 because of the top border.
+    int offset = 1;
+    for (int i = 0; i < m_selection_index; i++) {
+      offset += m_fields[i].FieldDelegateGetHeight();
+    }
+    context.Offset(offset);
+
+    // If the scroll context is touching the top border, include it in the
+    // context to show the label.
+    if (context.start == 1)
+      context.start--;
+
+    // If the scroll context is touching the new button, include it as well as
+    // the bottom border in the context.
+    if (context.end == height - 3)
+      context.end += 2;
+
+    return context;
   }
 
   void DrawRemoveButton(SubPad &surface, int highlight) {
@@ -1900,6 +1954,51 @@ public:
     return height;
   }
 
+  ScrollContext GetScrollContext() {
+    if (m_selection_type == SelectionType::Action)
+      return ScrollContext(GetContentHeight() - 1);
+
+    FieldDelegateSP &field = m_delegate_sp->GetField(m_selection_index);
+    ScrollContext context = field->FieldDelegateGetScrollContext();
+
+    int offset = GetErrorHeight();
+    for (int i = 0; i < m_selection_index; i++) {
+      offset += m_delegate_sp->GetField(i)->FieldDelegateGetHeight();
+    }
+    context.Offset(offset);
+
+    // If the context is touching the error, include the error in the context as
+    // well.
+    if (context.start == GetErrorHeight())
+      context.start = 0;
+
+    return context;
+  }
+
+  void UpdateScrolling(DerivedWindow &surface) {
+    ScrollContext context = GetScrollContext();
+    int content_height = GetContentHeight();
+    int surface_height = surface.GetHeight();
+    int visible_height = std::min(content_height, surface_height);
+    int last_visible_line = m_first_visible_line + visible_height - 1;
+
+    // If the last visible line is bigger than the content, then it is invalid
+    // and needs to be set to the last line in the content. This can happen when
+    // a field has shrunk in height.
+    if (last_visible_line > content_height - 1) {
+      m_first_visible_line = content_height - visible_height;
+    }
+
+    if (context.start < m_first_visible_line) {
+      m_first_visible_line = context.start;
+      return;
+    }
+
+    if (context.end > last_visible_line) {
+      m_first_visible_line = context.end - visible_height + 1;
+    }
+  }
+
   void DrawError(SubPad &surface) {
     if (!m_delegate_sp->HasError())
       return;
@@ -1956,7 +2055,12 @@ public:
     DrawActions(actions_surface);
   }
 
+  // Contents are first drawn on a pad. Then a subset of that pad is copied to
+  // the derived window starting at the first visible line. This essentially
+  // provides scrolling functionality.
   void DrawContent(DerivedWindow &surface) {
+    UpdateScrolling(surface);
+
     int width = surface.GetWidth();
     int height = GetContentHeight();
     Pad pad = Pad(Size(width, height));
@@ -1968,7 +2072,7 @@ public:
     SubPad elements_surface = SubPad(pad, elements_bounds);
 
     DrawError(error_surface);
-    DrawElements(error_surface);
+    DrawElements(elements_surface);
 
     int copy_height = std::min(surface.GetHeight(), pad.GetHeight());
     pad.CopyToSurface(surface, Point(0, m_first_visible_line), Point(),
@@ -1976,6 +2080,7 @@ public:
   }
 
   bool WindowDelegateDraw(Window &window, bool force) override {
+
     window.Erase();
 
     window.DrawTitleBox(window.GetName(), "Press Esc to cancel");
@@ -2062,6 +2167,9 @@ public:
   void ExecuteAction(Window &window) {
     FormAction &action = m_delegate_sp->GetAction(m_selection_index);
     action.Execute(window);
+    m_first_visible_line = 0;
+    m_selection_index = 0;
+    m_selection_type = SelectionType::Field;
   }
 
   HandleCharResult WindowDelegateHandleChar(Window &window, int key) override {
