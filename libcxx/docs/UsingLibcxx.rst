@@ -253,8 +253,11 @@ C++20 Specific Configuration Macros:
   This macro is used to re-enable redundant members of `allocator<T>`,
   including `pointer`, `reference`, `rebind`, `address`, `max_size`,
   `construct`, `destroy`, and the two-argument overload of `allocate`.
-  It also re-enables the library-provided explicit specializations
-  of `allocator<void>` and `allocator<const void>`.
+
+**_LIBCPP_ENABLE_CXX20_REMOVED_BINDER_TYPEDEFS**:
+  This macro is used to re-enable the `argument_type`, `result_type`,
+  `first_argument_type`, and `second_argument_type` members of class
+  templates such as `plus`, `logical_not`, `hash`, and `owner_less`.
 
 **_LIBCPP_ENABLE_CXX20_REMOVED_NEGATORS**:
   This macro is used to re-enable `not1`, `not2`, `unary_negate`,
@@ -263,6 +266,9 @@ C++20 Specific Configuration Macros:
 **_LIBCPP_ENABLE_CXX20_REMOVED_RAW_STORAGE_ITERATOR**:
   This macro is used to re-enable `raw_storage_iterator`.
 
+**_LIBCPP_ENABLE_CXX20_REMOVED_TYPE_TRAITS**:
+  This macro is used to re-enable `is_literal_type`, `is_literal_type_v`, 
+  `result_of` and `result_of_t`.
 
 Libc++ Extensions
 =================

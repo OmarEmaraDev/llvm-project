@@ -84,7 +84,7 @@ private:
     lldb::addr_t m_data_ptr = 0;
     uint8_t m_flags = 0;
 
-    objc_class_t() {}
+    objc_class_t() = default;
 
     void Clear() {
       m_isa = 0;
@@ -166,7 +166,8 @@ private:
              + field_size; // IMP imp;
     }
 
-    bool Read(Process *process, lldb::addr_t addr, bool, bool);
+    bool Read(Process *process, lldb::addr_t addr,
+              lldb::addr_t relative_method_lists_base_addr, bool, bool);
   };
 
   struct ivar_list_t {

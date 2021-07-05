@@ -687,11 +687,17 @@ void RISCVDAGToDAGISel::Select(SDNode *Node) {
         return;
       }
 
+      // Mask needs to be copied to V0.
+      SDValue Chain = CurDAG->getCopyToReg(CurDAG->getEntryNode(), DL,
+                                           RISCV::V0, Mask, SDValue());
+      SDValue Glue = Chain.getValue(1);
+      SDValue V0 = CurDAG->getRegister(RISCV::V0, VT);
+
       // Otherwise use
       // vmslt{u}.vx vd, va, x, v0.t; vmxor.mm vd, vd, v0
       SDValue Cmp = SDValue(
           CurDAG->getMachineNode(VMSLTMaskOpcode, DL, VT,
-                                 {MaskedOff, Src1, Src2, Mask, VL, SEW}),
+                                 {MaskedOff, Src1, Src2, V0, VL, SEW, Glue}),
           0);
       ReplaceNode(Node, CurDAG->getMachineNode(VMXOROpcode, DL, VT,
                                                {Cmp, Mask, VL, MaskSEW}));
@@ -1338,14 +1344,8 @@ bool RISCVDAGToDAGISel::selectSExti32(SDValue N, SDValue &Val) {
     Val = N.getOperand(0);
     return true;
   }
-  // FIXME: Should we just call computeNumSignBits here?
-  if (N.getOpcode() == ISD::AssertSext &&
-      cast<VTSDNode>(N->getOperand(1))->getVT().bitsLE(MVT::i32)) {
-    Val = N;
-    return true;
-  }
-  if (N.getOpcode() == ISD::AssertZext &&
-      cast<VTSDNode>(N->getOperand(1))->getVT().bitsLT(MVT::i32)) {
+  MVT VT = N.getSimpleValueType();
+  if (CurDAG->ComputeNumSignBits(N) > (VT.getSizeInBits() - 32)) {
     Val = N;
     return true;
   }
@@ -1361,9 +1361,9 @@ bool RISCVDAGToDAGISel::selectZExti32(SDValue N, SDValue &Val) {
       return true;
     }
   }
-  // FIXME: Should we just call computeKnownBits here?
-  if (N.getOpcode() == ISD::AssertZext &&
-      cast<VTSDNode>(N->getOperand(1))->getVT().bitsLE(MVT::i32)) {
+  MVT VT = N.getSimpleValueType();
+  APInt Mask = APInt::getHighBitsSet(VT.getSizeInBits(), 32);
+  if (CurDAG->MaskedValueIsZero(N, Mask)) {
     Val = N;
     return true;
   }

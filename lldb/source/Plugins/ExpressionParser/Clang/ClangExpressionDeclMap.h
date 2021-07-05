@@ -251,7 +251,7 @@ public:
     lldb::ByteOrder byte_order = lldb::eByteOrderInvalid;
     size_t address_byte_size = 0;
 
-    TargetInfo() {}
+    TargetInfo() = default;
 
     bool IsValid() {
       return (byte_order != lldb::eByteOrderInvalid && address_byte_size != 0);
@@ -308,7 +308,7 @@ private:
   /// The following values should not live beyond parsing
   class ParserVars {
   public:
-    ParserVars() {}
+    ParserVars() = default;
 
     Target *GetTarget() {
       if (m_exe_ctx.GetTargetPtr())
@@ -607,13 +607,8 @@ private:
   ///
   /// \param[in] type
   ///     The type of the class that serves as the evaluation context.
-  ///
-  /// \param[in] context_method
-  ///     The member function declaration in which the expression is being
-  ///     evaluated or null if the expression is not evaluated in the context
-  ///     of a member function.
-  void AddContextClassType(NameSearchContext &context, const TypeFromUser &type,
-                           clang::CXXMethodDecl *context_method = nullptr);
+  void AddContextClassType(NameSearchContext &context,
+                           const TypeFromUser &type);
 
   /// Move a type out of the current ASTContext into another, but make sure to
   /// export all components of the type also.

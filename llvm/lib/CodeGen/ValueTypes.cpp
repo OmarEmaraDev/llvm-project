@@ -198,10 +198,6 @@ Type *EVT::getTypeForEVT(LLVMContext &Context) const {
   case MVT::ppcf128: return Type::getPPC_FP128Ty(Context);
   case MVT::x86mmx:  return Type::getX86_MMXTy(Context);
   case MVT::x86amx:  return Type::getX86_AMXTy(Context);
-  case MVT::externref:
-    return PointerType::get(StructType::create(Context), 10);
-  case MVT::funcref:
-    return PointerType::get(StructType::create(Context), 20);
   case MVT::v1i1:
     return FixedVectorType::get(Type::getInt1Ty(Context), 1);
   case MVT::v2i1:
@@ -278,6 +274,10 @@ Type *EVT::getTypeForEVT(LLVMContext &Context) const {
     return FixedVectorType::get(Type::getInt32Ty(Context), 4);
   case MVT::v5i32:
     return FixedVectorType::get(Type::getInt32Ty(Context), 5);
+  case MVT::v6i32:
+    return FixedVectorType::get(Type::getInt32Ty(Context), 6);
+  case MVT::v7i32:
+    return FixedVectorType::get(Type::getInt32Ty(Context), 7);
   case MVT::v8i32:
     return FixedVectorType::get(Type::getInt32Ty(Context), 8);
   case MVT::v16i32:
@@ -300,6 +300,8 @@ Type *EVT::getTypeForEVT(LLVMContext &Context) const {
     return FixedVectorType::get(Type::getInt64Ty(Context), 1);
   case MVT::v2i64:
     return FixedVectorType::get(Type::getInt64Ty(Context), 2);
+  case MVT::v3i64:
+    return FixedVectorType::get(Type::getInt64Ty(Context), 3);
   case MVT::v4i64:
     return FixedVectorType::get(Type::getInt64Ty(Context), 4);
   case MVT::v8i64:
@@ -364,6 +366,10 @@ Type *EVT::getTypeForEVT(LLVMContext &Context) const {
     return FixedVectorType::get(Type::getFloatTy(Context), 4);
   case MVT::v5f32:
     return FixedVectorType::get(Type::getFloatTy(Context), 5);
+  case MVT::v6f32:
+    return FixedVectorType::get(Type::getFloatTy(Context), 6);
+  case MVT::v7f32:
+    return FixedVectorType::get(Type::getFloatTy(Context), 7);
   case MVT::v8f32:
     return FixedVectorType::get(Type::getFloatTy(Context), 8);
   case MVT::v16f32:
@@ -386,6 +392,8 @@ Type *EVT::getTypeForEVT(LLVMContext &Context) const {
     return FixedVectorType::get(Type::getDoubleTy(Context), 1);
   case MVT::v2f64:
     return FixedVectorType::get(Type::getDoubleTy(Context), 2);
+  case MVT::v3f64:
+    return FixedVectorType::get(Type::getDoubleTy(Context), 3);
   case MVT::v4f64:
     return FixedVectorType::get(Type::getDoubleTy(Context), 4);
   case MVT::v8f64:

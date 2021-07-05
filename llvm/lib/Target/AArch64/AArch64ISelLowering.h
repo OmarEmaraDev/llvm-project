@@ -236,9 +236,8 @@ enum NodeType : unsigned {
   SRHADD,
   URHADD,
 
-  // Absolute difference
-  UABD,
-  SABD,
+  // Unsigned Add Long Pairwise
+  UADDLP,
 
   // udot/sdot instructions
   UDOT,
@@ -647,7 +646,7 @@ public:
     return TargetLowering::shouldFormOverflowOp(Opcode, VT, true);
   }
 
-  Value *emitLoadLinked(IRBuilderBase &Builder, Value *Addr,
+  Value *emitLoadLinked(IRBuilderBase &Builder, Type *ValueTy, Value *Addr,
                         AtomicOrdering Ord) const override;
   Value *emitStoreConditional(IRBuilderBase &Builder, Value *Val, Value *Addr,
                               AtomicOrdering Ord) const override;
@@ -798,9 +797,10 @@ public:
   MachineMemOperand::Flags getTargetMMOFlags(
     const Instruction &I) const override;
 
-  bool functionArgumentNeedsConsecutiveRegisters(Type *Ty,
-                                                 CallingConv::ID CallConv,
-                                                 bool isVarArg) const override;
+  bool functionArgumentNeedsConsecutiveRegisters(
+      Type *Ty, CallingConv::ID CallConv, bool isVarArg,
+      const DataLayout &DL) const override;
+
   /// Used for exception handling on Win64.
   bool needsFixedCatchObjects() const override;
 
@@ -851,6 +851,7 @@ private:
                           SmallVectorImpl<SDValue> &InVals, bool isThisReturn,
                           SDValue ThisVal) const;
 
+  SDValue LowerLOAD(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSTORE(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerABS(SDValue Op, SelectionDAG &DAG) const;
 
@@ -1005,6 +1006,8 @@ private:
   SDValue LowerFixedLengthFPRoundToSVE(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerFixedLengthIntToFPToSVE(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerFixedLengthFPToIntToSVE(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerFixedLengthVECTOR_SHUFFLEToSVE(SDValue Op,
+                                              SelectionDAG &DAG) const;
 
   SDValue BuildSDIVPow2(SDNode *N, const APInt &Divisor, SelectionDAG &DAG,
                         SmallVectorImpl<SDNode *> &Created) const override;
@@ -1065,6 +1068,8 @@ private:
 
   void ReplaceNodeResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
                           SelectionDAG &DAG) const override;
+  void ReplaceBITCASTResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
+                             SelectionDAG &DAG) const;
   void ReplaceExtractSubVectorResults(SDNode *N,
                                       SmallVectorImpl<SDValue> &Results,
                                       SelectionDAG &DAG) const;

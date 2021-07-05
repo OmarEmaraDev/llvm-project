@@ -8,6 +8,7 @@
 
 #include "Driver.h"
 #include "Config.h"
+#include "ICF.h"
 #include "InputFiles.h"
 #include "LTO.h"
 #include "MarkLive.h"
@@ -18,6 +19,7 @@
 #include "Symbols.h"
 #include "SyntheticSections.h"
 #include "Target.h"
+#include "UnwindInfoSection.h"
 #include "Writer.h"
 
 #include "lld/Common/Args.h"
@@ -235,6 +237,8 @@ static std::vector<ArchiveMember> getArchiveMembers(MemoryBufferRef mb) {
   return v;
 }
 
+static DenseMap<StringRef, ArchiveFile *> loadedArchives;
+
 static InputFile *addFile(StringRef path, bool forceLoadArchive,
                           bool isExplicit = true,
                           bool isBundleLoader = false) {
@@ -247,6 +251,15 @@ static InputFile *addFile(StringRef path, bool forceLoadArchive,
   file_magic magic = identify_magic(mbref.getBuffer());
   switch (magic) {
   case file_magic::archive: {
+    // Avoid loading archives twice. If the archives are being force-loaded,
+    // loading them twice would create duplicate symbol errors. In the
+    // non-force-loading case, this is just a minor performance optimization.
+    // We don't take a reference to cachedFile here because the
+    // loadArchiveMember() call below may recursively call addFile() and
+    // invalidate this reference.
+    if (ArchiveFile *cachedFile = loadedArchives[path])
+      return cachedFile;
+
     std::unique_ptr<object::Archive> file = CHECK(
         object::Archive::create(mbref), path + ": failed to parse archive");
 
@@ -286,7 +299,7 @@ static InputFile *addFile(StringRef path, bool forceLoadArchive,
       }
     }
 
-    newFile = make<ArchiveFile>(std::move(file));
+    newFile = loadedArchives[path] = make<ArchiveFile>(std::move(file));
     break;
   }
   case file_magic::macho_object:
@@ -533,21 +546,19 @@ static void replaceCommonSymbols() {
     if (common == nullptr)
       continue;
 
-    auto *isec = make<ConcatInputSection>();
-    isec->file = common->getFile();
-    isec->name = section_names::common;
-    isec->segname = segment_names::data;
-    isec->align = common->align;
     // Casting to size_t will truncate large values on 32-bit architectures,
     // but it's not really worth supporting the linking of 64-bit programs on
     // 32-bit archs.
-    isec->data = {nullptr, static_cast<size_t>(common->size)};
-    isec->flags = S_ZEROFILL;
+    ArrayRef<uint8_t> data = {nullptr, static_cast<size_t>(common->size)};
+    auto *isec = make<ConcatInputSection>(
+        segment_names::data, section_names::common, common->getFile(), data,
+        common->align, S_ZEROFILL);
     inputSections.push_back(isec);
 
     // FIXME: CommonSymbol should store isReferencedDynamically, noDeadStrip
     // and pass them on here.
-    replaceSymbol<Defined>(sym, sym->getName(), isec->file, isec, /*value=*/0,
+    replaceSymbol<Defined>(sym, sym->getName(), isec->getFile(), isec,
+                           /*value=*/0,
                            /*size=*/0,
                            /*isWeakDef=*/false,
                            /*isExternal=*/true, common->privateExtern,
@@ -690,6 +701,29 @@ getUndefinedSymbolTreatment(const ArgList &args) {
   return treatment;
 }
 
+static ICFLevel getICFLevel(const ArgList &args) {
+  bool noDeduplicate = args.hasArg(OPT_no_deduplicate);
+  StringRef icfLevelStr = args.getLastArgValue(OPT_icf_eq);
+  auto icfLevel = StringSwitch<ICFLevel>(icfLevelStr)
+                      .Cases("none", "", ICFLevel::none)
+                      .Case("safe", ICFLevel::safe)
+                      .Case("all", ICFLevel::all)
+                      .Default(ICFLevel::unknown);
+  if (icfLevel == ICFLevel::unknown) {
+    warn(Twine("unknown --icf=OPTION `") + icfLevelStr +
+         "', defaulting to `none'");
+    icfLevel = ICFLevel::none;
+  } else if (icfLevel != ICFLevel::none && noDeduplicate) {
+    warn(Twine("`--icf=" + icfLevelStr +
+               "' conflicts with -no_deduplicate, setting to `none'"));
+    icfLevel = ICFLevel::none;
+  } else if (icfLevel == ICFLevel::safe) {
+    warn(Twine("`--icf=safe' is not yet implemented, reverting to `none'"));
+    icfLevel = ICFLevel::none;
+  }
+  return icfLevel;
+}
+
 static void warnIfDeprecatedOption(const Option &opt) {
   if (!opt.getGroup().isValid())
     return;
@@ -808,6 +842,20 @@ static std::vector<SectionAlign> parseSectAlign(const opt::InputArgList &args) {
 }
 
 static bool dataConstDefault(const InputArgList &args) {
+  static const std::map<PlatformKind, VersionTuple> minVersion = {
+      {PlatformKind::macOS, VersionTuple(10, 15)},
+      {PlatformKind::iOS, VersionTuple(13, 0)},
+      {PlatformKind::iOSSimulator, VersionTuple(13, 0)},
+      {PlatformKind::tvOS, VersionTuple(13, 0)},
+      {PlatformKind::tvOSSimulator, VersionTuple(13, 0)},
+      {PlatformKind::watchOS, VersionTuple(6, 0)},
+      {PlatformKind::watchOSSimulator, VersionTuple(6, 0)},
+      {PlatformKind::bridgeOS, VersionTuple(4, 0)}};
+  auto it = minVersion.find(config->platformInfo.target.Platform);
+  if (it != minVersion.end())
+    if (config->platformInfo.minimum < it->second)
+      return false;
+
   switch (config->outputType) {
   case MH_EXECUTE:
     return !args.hasArg(OPT_no_pie);
@@ -936,6 +984,48 @@ void createFiles(const InputArgList &args) {
   }
 }
 
+static void gatherInputSections() {
+  TimeTraceScope timeScope("Gathering input sections");
+  int inputOrder = 0;
+  for (const InputFile *file : inputFiles) {
+    for (const SubsectionMap &map : file->subsections) {
+      for (const SubsectionEntry &entry : map) {
+        if (auto *isec = dyn_cast<ConcatInputSection>(entry.isec)) {
+          if (isec->isCoalescedWeak())
+            continue;
+          if (isec->getSegName() == segment_names::ld) {
+            assert(isec->getName() == section_names::compactUnwind);
+            in.unwindInfo->addInput(isec);
+            continue;
+          }
+          isec->outSecOff = inputOrder++;
+          inputSections.push_back(isec);
+        } else if (auto *isec = dyn_cast<CStringInputSection>(entry.isec)) {
+          if (in.cStringSection->inputOrder == UnspecifiedInputOrder)
+            in.cStringSection->inputOrder = inputOrder++;
+          in.cStringSection->addInput(isec);
+        } else if (auto *isec = dyn_cast<WordLiteralInputSection>(entry.isec)) {
+          if (in.wordLiteralSection->inputOrder == UnspecifiedInputOrder)
+            in.wordLiteralSection->inputOrder = inputOrder++;
+          in.wordLiteralSection->addInput(isec);
+        } else {
+          llvm_unreachable("unexpected input section kind");
+        }
+      }
+    }
+  }
+  assert(inputOrder <= UnspecifiedInputOrder);
+}
+
+static void foldIdenticalLiterals() {
+  // We always create a cStringSection, regardless of whether dedupLiterals is
+  // true. If it isn't, we simply create a non-deduplicating CStringSection.
+  // Either way, we must unconditionally finalize it here.
+  in.cStringSection->finalizeContents();
+  if (in.wordLiteralSection)
+    in.wordLiteralSection->finalizeContents();
+}
+
 bool macho::link(ArrayRef<const char *> argsArr, bool canExitEarly,
                  raw_ostream &stdoutOS, raw_ostream &stderrOS) {
   lld::stdoutOS = &stdoutOS;
@@ -1035,6 +1125,9 @@ bool macho::link(ArrayRef<const char *> argsArr, bool canExitEarly,
   config->ltoNewPassManager =
       args.hasFlag(OPT_no_lto_legacy_pass_manager, OPT_lto_legacy_pass_manager,
                    LLVM_ENABLE_NEW_PASS_MANAGER);
+  config->ltoo = args::getInteger(args, OPT_lto_O, 2);
+  if (config->ltoo > 3)
+    error("--lto-O: invalid optimization level: " + Twine(config->ltoo));
   config->runtimePaths = args::getStrings(args, OPT_rpath);
   config->allLoad = args.hasArg(OPT_all_load);
   config->forceLoadObjC = args.hasArg(OPT_ObjC);
@@ -1042,9 +1135,14 @@ bool macho::link(ArrayRef<const char *> argsArr, bool canExitEarly,
   config->deadStripDylibs = args.hasArg(OPT_dead_strip_dylibs);
   config->demangle = args.hasArg(OPT_demangle);
   config->implicitDylibs = !args.hasArg(OPT_no_implicit_dylibs);
-  config->emitFunctionStarts = !args.hasArg(OPT_no_function_starts);
+  config->emitFunctionStarts =
+      args.hasFlag(OPT_function_starts, OPT_no_function_starts, true);
   config->emitBitcodeBundle = args.hasArg(OPT_bitcode_bundle);
-  config->dedupLiterals = args.hasArg(OPT_deduplicate_literals);
+  config->emitDataInCodeInfo =
+      args.hasFlag(OPT_data_in_code_info, OPT_no_data_in_code_info, true);
+  config->icfLevel = getICFLevel(args);
+  config->dedupLiterals = args.hasArg(OPT_deduplicate_literals) ||
+                          config->icfLevel != ICFLevel::none;
 
   // FIXME: Add a commandline flag for this too.
   config->zeroModTime = getenv("ZERO_AR_DATE");
@@ -1289,18 +1387,16 @@ bool macho::link(ArrayRef<const char *> argsArr, bool canExitEarly,
         inputFiles.insert(make<OpaqueFile>(*buffer, segName, sectName));
     }
 
-    {
-      TimeTraceScope timeScope("Gathering input sections");
-      // Gather all InputSections into one vector.
-      for (const InputFile *file : inputFiles) {
-        for (const SubsectionMap &map : file->subsections)
-          for (const SubsectionEntry &subsectionEntry : map)
-            inputSections.push_back(subsectionEntry.isec);
-      }
-    }
+    gatherInputSections();
 
     if (config->deadStrip)
       markLive();
+
+    // ICF assumes that all literals have been folded already, so we must run
+    // foldIdenticalLiterals before foldIdenticalSections.
+    foldIdenticalLiterals();
+    if (config->icfLevel != ICFLevel::none)
+      foldIdenticalSections();
 
     // Write to an output file.
     if (target->wordSize == 8)

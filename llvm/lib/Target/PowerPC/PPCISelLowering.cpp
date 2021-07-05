@@ -6954,10 +6954,38 @@ SDValue PPCTargetLowering::LowerFormalArguments_AIX(
     if (VA.isRegLoc()) {
       if (VA.getValVT().isScalarInteger())
         FuncInfo->appendParameterType(PPCFunctionInfo::FixedType);
-      else if (VA.getValVT().isFloatingPoint() && !VA.getValVT().isVector())
-        FuncInfo->appendParameterType(VA.getValVT().SimpleTy == MVT::f32
-                                          ? PPCFunctionInfo::ShortFloatPoint
-                                          : PPCFunctionInfo::LongFloatPoint);
+      else if (VA.getValVT().isFloatingPoint() && !VA.getValVT().isVector()) {
+        switch (VA.getValVT().SimpleTy) {
+        default:
+          report_fatal_error("Unhandled value type for argument.");
+        case MVT::f32:
+          FuncInfo->appendParameterType(PPCFunctionInfo::ShortFloatingPoint);
+          break;
+        case MVT::f64:
+          FuncInfo->appendParameterType(PPCFunctionInfo::LongFloatingPoint);
+          break;
+        }
+      } else if (VA.getValVT().isVector()) {
+        switch (VA.getValVT().SimpleTy) {
+        default:
+          report_fatal_error("Unhandled value type for argument.");
+        case MVT::v16i8:
+          FuncInfo->appendParameterType(PPCFunctionInfo::VectorChar);
+          break;
+        case MVT::v8i16:
+          FuncInfo->appendParameterType(PPCFunctionInfo::VectorShort);
+          break;
+        case MVT::v4i32:
+        case MVT::v2i64:
+        case MVT::v1i128:
+          FuncInfo->appendParameterType(PPCFunctionInfo::VectorInt);
+          break;
+        case MVT::v4f32:
+        case MVT::v2f64:
+          FuncInfo->appendParameterType(PPCFunctionInfo::VectorFloat);
+          break;
+        }
+      }
     }
 
     if (Flags.isByVal() && VA.isMemLoc()) {
@@ -15174,13 +15202,17 @@ SDValue PPCTargetLowering::PerformDAGCombine(SDNode *N,
       }
     }
     break;
-  case ISD::BSWAP:
+  case ISD::BSWAP: {
     // Turn BSWAP (LOAD) -> lhbrx/lwbrx.
-    if (ISD::isNON_EXTLoad(N->getOperand(0).getNode()) &&
-        N->getOperand(0).hasOneUse() &&
+    // For subtargets without LDBRX, we can still do better than the default
+    // expansion even for 64-bit BSWAP (LOAD).
+    bool Is64BitBswapOn64BitTgt =
+        Subtarget.isPPC64() && N->getValueType(0) == MVT::i64;
+    bool IsSingleUseNormalLd = ISD::isNormalLoad(N->getOperand(0).getNode()) &&
+                               N->getOperand(0).hasOneUse();
+    if (IsSingleUseNormalLd &&
         (N->getValueType(0) == MVT::i32 || N->getValueType(0) == MVT::i16 ||
-         (Subtarget.hasLDBRX() && Subtarget.isPPC64() &&
-          N->getValueType(0) == MVT::i64))) {
+         (Subtarget.hasLDBRX() && Is64BitBswapOn64BitTgt))) {
       SDValue Load = N->getOperand(0);
       LoadSDNode *LD = cast<LoadSDNode>(Load);
       // Create the byte-swapping load.
@@ -15211,7 +15243,38 @@ SDValue PPCTargetLowering::PerformDAGCombine(SDNode *N,
       // Return N so it doesn't get rechecked!
       return SDValue(N, 0);
     }
-    break;
+    // Convert this to two 32-bit bswap loads and a BUILD_PAIR. Do this only
+    // before legalization so that the BUILD_PAIR is handled correctly.
+    if (!DCI.isBeforeLegalize() || !Is64BitBswapOn64BitTgt ||
+        !IsSingleUseNormalLd)
+      return SDValue();
+    LoadSDNode *LD = cast<LoadSDNode>(N->getOperand(0));
+
+    // Can't split volatile or atomic loads.
+    // FIXME: Disabling this to unblock the big endian bot until I can get it
+    // fixed.
+    if (!LD->isSimple() || !Subtarget.hasLDBRX())
+      return SDValue();
+    SDValue BasePtr = LD->getBasePtr();
+    SDValue Lo = DAG.getLoad(MVT::i32, dl, LD->getChain(), BasePtr,
+                             LD->getPointerInfo(), LD->getAlignment());
+    Lo = DAG.getNode(ISD::BSWAP, dl, MVT::i32, Lo);
+    BasePtr = DAG.getNode(ISD::ADD, dl, BasePtr.getValueType(), BasePtr,
+                          DAG.getIntPtrConstant(4, dl));
+    SDValue Hi = DAG.getLoad(MVT::i32, dl, LD->getChain(), BasePtr,
+                             LD->getPointerInfo(), LD->getAlignment());
+    Hi = DAG.getNode(ISD::BSWAP, dl, MVT::i32, Hi);
+    SDValue Res;
+    if (Subtarget.isLittleEndian())
+      Res = DAG.getNode(ISD::BUILD_PAIR, dl, MVT::i64, Hi, Lo);
+    else
+      Res = DAG.getNode(ISD::BUILD_PAIR, dl, MVT::i64, Lo, Hi);
+    SDValue TF =
+        DAG.getNode(ISD::TokenFactor, dl, MVT::Other,
+                    Hi.getOperand(0).getValue(1), Lo.getOperand(0).getValue(1));
+    DAG.ReplaceAllUsesOfValueWith(SDValue(LD, 1), TF);
+    return Res;
+  }
   case PPCISD::VCMP:
     // If a VCMP_rec node already exists with exactly the same operands as this
     // node, use its result instead of this node (VCMP_rec computes both a CR6
@@ -15648,7 +15711,13 @@ PPCTargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
   } else if ((Constraint == "wa" || Constraint == "wd" ||
              Constraint == "wf" || Constraint == "wi") &&
              Subtarget.hasVSX()) {
-    return std::make_pair(0U, &PPC::VSRCRegClass);
+    // A VSX register for either a scalar (FP) or vector. There is no
+    // support for single precision scalars on subtargets prior to Power8.
+    if (VT.isVector())
+      return std::make_pair(0U, &PPC::VSRCRegClass);
+    if (VT == MVT::f32 && Subtarget.hasP8Vector())
+      return std::make_pair(0U, &PPC::VSSRCRegClass);
+    return std::make_pair(0U, &PPC::VSFRCRegClass);
   } else if ((Constraint == "ws" || Constraint == "ww") && Subtarget.hasVSX()) {
     if (VT == MVT::f32 && Subtarget.hasP8Vector())
       return std::make_pair(0U, &PPC::VSSRCRegClass);
@@ -15709,7 +15778,7 @@ PPCTargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
                           &PPC::G8RCRegClass);
 
   // GCC accepts 'cc' as an alias for 'cr0', and we need to do the same.
-  if (!R.second && StringRef("{cc}").equals_lower(Constraint)) {
+  if (!R.second && StringRef("{cc}").equals_insensitive(Constraint)) {
     R.first = PPC::CR0;
     R.second = &PPC::CRRCRegClass;
   }

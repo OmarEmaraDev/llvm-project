@@ -2873,7 +2873,7 @@ InitListChecker::CheckDesignatedInitializer(const InitializedEntity &Entity,
       if (!VerifyOnly)
         SemaRef.Diag(IndexExpr->getBeginLoc(),
                      diag::err_array_designator_too_large)
-            << DesignatedEndIndex.toString(10) << MaxElements.toString(10)
+            << toString(DesignatedEndIndex, 10) << toString(MaxElements, 10)
             << IndexExpr->getSourceRange();
       ++Index;
       return true;
@@ -3167,7 +3167,7 @@ CheckArrayDesignatorExpr(Sema &S, Expr *Index, llvm::APSInt &Value) {
 
   if (Value.isSigned() && Value.isNegative())
     return S.Diag(Loc, diag::err_array_designator_negative)
-      << Value.toString(10) << Index->getSourceRange();
+           << toString(Value, 10) << Index->getSourceRange();
 
   Value.setIsUnsigned(true);
   return Result;
@@ -3236,7 +3236,7 @@ ExprResult Sema::ActOnDesignatedInitializer(Designation &Desig,
 
         if (!StartDependent && !EndDependent && EndValue < StartValue) {
           Diag(D.getEllipsisLoc(), diag::err_array_designator_empty_range)
-            << StartValue.toString(10) << EndValue.toString(10)
+            << toString(StartValue, 10) << toString(EndValue, 10)
             << StartIndex->getSourceRange() << EndIndex->getSourceRange();
           Invalid = true;
         } else {
@@ -5065,9 +5065,9 @@ static void TryReferenceInitializationCore(Sema &S,
   //        than, cv2; otherwise, the program is ill-formed.
   unsigned T1CVRQuals = T1Quals.getCVRQualifiers();
   unsigned T2CVRQuals = T2Quals.getCVRQualifiers();
-  if ((RefRelationship == Sema::Ref_Related &&
-       (T1CVRQuals | T2CVRQuals) != T1CVRQuals) ||
-      !T1Quals.isAddressSpaceSupersetOf(T2Quals)) {
+  if (RefRelationship == Sema::Ref_Related &&
+      ((T1CVRQuals | T2CVRQuals) != T1CVRQuals ||
+       !T1Quals.isAddressSpaceSupersetOf(T2Quals))) {
     Sequence.SetFailed(InitializationSequence::FK_ReferenceInitDropsQualifiers);
     return;
   }

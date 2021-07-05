@@ -1248,6 +1248,10 @@ void SelectionDAGBuilder::resolveDanglingDebugInfo(const Value *V,
 }
 
 void SelectionDAGBuilder::salvageUnresolvedDbgValue(DanglingDebugInfo &DDI) {
+  // TODO: For the variadic implementation, instead of only checking the fail
+  // state of `handleDebugValue`, we need know specifically which values were
+  // invalid, so that we attempt to salvage only those values when processing
+  // a DIArgList.
   assert(!DDI.getDI()->hasArgList() &&
          "Not implemented for variadic dbg_values");
   Value *V = DDI.getDI()->getValue(0);
@@ -1271,16 +1275,21 @@ void SelectionDAGBuilder::salvageUnresolvedDbgValue(DanglingDebugInfo &DDI) {
   while (isa<Instruction>(V)) {
     Instruction &VAsInst = *cast<Instruction>(V);
     // Temporary "0", awaiting real implementation.
-    DIExpression *NewExpr = salvageDebugInfoImpl(VAsInst, Expr, StackValue, 0);
+    SmallVector<Value *, 4> AdditionalValues;
+    DIExpression *SalvagedExpr =
+        salvageDebugInfoImpl(VAsInst, Expr, StackValue, 0, AdditionalValues);
 
     // If we cannot salvage any further, and haven't yet found a suitable debug
     // expression, bail out.
-    if (!NewExpr)
+    // TODO: If AdditionalValues isn't empty, then the salvage can only be
+    // represented with a DBG_VALUE_LIST, so we give up. When we have support
+    // here for variadic dbg_values, remove that condition.
+    if (!SalvagedExpr || !AdditionalValues.empty())
       break;
 
     // New value and expr now represent this debuginfo.
     V = VAsInst.getOperand(0);
-    Expr = NewExpr;
+    Expr = SalvagedExpr;
 
     // Some kind of simplification occurred: check whether the operand of the
     // salvaged debug expression can be encoded in this DAG.
@@ -1933,7 +1942,7 @@ void SelectionDAGBuilder::visitRet(const ReturnInst &I) {
 
       bool NeedsRegBlock = TLI.functionArgumentNeedsConsecutiveRegisters(
           I.getOperand(0)->getType(), F->getCallingConv(),
-          /*IsVarArg*/ false);
+          /*IsVarArg*/ false, DL);
 
       ISD::NodeType ExtendKind = ISD::ANY_EXTEND;
       if (F->getAttributes().hasAttribute(AttributeList::ReturnIndex,
@@ -4400,7 +4409,7 @@ void SelectionDAGBuilder::visitMaskedScatter(const CallInst &I) {
   EVT VT = Src0.getValueType();
   Align Alignment = cast<ConstantInt>(I.getArgOperand(2))
                         ->getMaybeAlignValue()
-                        .getValueOr(DAG.getEVTAlign(VT));
+                        .getValueOr(DAG.getEVTAlign(VT.getScalarType()));
   const TargetLowering &TLI = DAG.getTargetLoweringInfo();
 
   AAMDNodes AAInfo;
@@ -4518,7 +4527,7 @@ void SelectionDAGBuilder::visitMaskedGather(const CallInst &I) {
   EVT VT = TLI.getValueType(DAG.getDataLayout(), I.getType());
   Align Alignment = cast<ConstantInt>(I.getArgOperand(1))
                         ->getMaybeAlignValue()
-                        .getValueOr(DAG.getEVTAlign(VT));
+                        .getValueOr(DAG.getEVTAlign(VT.getScalarType()));
 
   AAMDNodes AAInfo;
   I.getAAMetadata(AAInfo);
@@ -6283,6 +6292,12 @@ void SelectionDAGBuilder::visitIntrinsicCall(const CallInst &I,
                              getValue(I.getArgOperand(0)),
                              getValue(I.getArgOperand(1)), Flags));
     return;
+  case Intrinsic::arithmetic_fence: {
+    setValue(&I, DAG.getNode(ISD::ARITH_FENCE, sdl,
+                             getValue(I.getArgOperand(0)).getValueType(),
+                             getValue(I.getArgOperand(0)), Flags));
+    return;
+  }
   case Intrinsic::fma:
     setValue(&I, DAG.getNode(
                      ISD::FMA, sdl, getValue(I.getArgOperand(0)).getValueType(),
@@ -9432,7 +9447,7 @@ TargetLowering::LowerCallTo(TargetLowering::CallLoweringInfo &CLI) const {
     CLI.IsTailCall = false;
   } else {
     bool NeedsRegBlock = functionArgumentNeedsConsecutiveRegisters(
-        CLI.RetTy, CLI.CallConv, CLI.IsVarArg);
+        CLI.RetTy, CLI.CallConv, CLI.IsVarArg, DL);
     for (unsigned I = 0, E = RetTys.size(); I != E; ++I) {
       ISD::ArgFlagsTy Flags;
       if (NeedsRegBlock) {
@@ -9492,7 +9507,7 @@ TargetLowering::LowerCallTo(TargetLowering::CallLoweringInfo &CLI) const {
     if (Args[i].IsByVal)
       FinalType = cast<PointerType>(Args[i].Ty)->getElementType();
     bool NeedsRegBlock = functionArgumentNeedsConsecutiveRegisters(
-        FinalType, CLI.CallConv, CLI.IsVarArg);
+        FinalType, CLI.CallConv, CLI.IsVarArg, DL);
     for (unsigned Value = 0, NumValues = ValueVTs.size(); Value != NumValues;
          ++Value) {
       EVT VT = ValueVTs[Value];
@@ -10043,7 +10058,7 @@ void SelectionDAGISel::LowerArguments(const Function &F) {
     if (Arg.hasAttribute(Attribute::ByVal))
       FinalType = Arg.getParamByValType();
     bool NeedsRegBlock = TLI->functionArgumentNeedsConsecutiveRegisters(
-        FinalType, F.getCallingConv(), F.isVarArg());
+        FinalType, F.getCallingConv(), F.isVarArg(), DL);
     for (unsigned Value = 0, NumValues = ValueVTs.size();
          Value != NumValues; ++Value) {
       EVT VT = ValueVTs[Value];

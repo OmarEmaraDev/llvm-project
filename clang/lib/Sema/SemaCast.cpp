@@ -61,6 +61,15 @@ namespace {
         ValueKind(Expr::getValueKindForType(destType)),
         Kind(CK_Dependent), IsARCUnbridgedCast(false) {
 
+      // C++ [expr.type]/8.2.2:
+      //   If a pr-value initially has the type cv-T, where T is a
+      //   cv-unqualified non-class, non-array type, the type of the
+      //   expression is adjusted to T prior to any further analysis.
+      if (!S.Context.getLangOpts().ObjC && !DestType->isRecordType() &&
+          !DestType->isArrayType()) {
+        DestType = DestType.getUnqualifiedType();
+      }
+
       if (const BuiltinType *placeholder =
             src.get()->getType()->getAsPlaceholderType()) {
         PlaceholderKind = placeholder->getKind();
@@ -2917,7 +2926,7 @@ void CastOperation::CheckCStyleCast() {
         }
         Self.Diag(OpRange.getBegin(),
                   diag::err_opencl_cast_non_zero_to_event_t)
-                  << CastInt.toString(10) << SrcExpr.get()->getSourceRange();
+                  << toString(CastInt, 10) << SrcExpr.get()->getSourceRange();
         SrcExpr = ExprError();
         return;
       }

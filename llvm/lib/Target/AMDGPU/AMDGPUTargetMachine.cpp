@@ -162,6 +162,11 @@ static cl::opt<bool> EnableRegReassign(
   cl::init(true),
   cl::Hidden);
 
+static cl::opt<bool> OptVGPRLiveRange(
+    "amdgpu-opt-vgpr-liverange",
+    cl::desc("Enable VGPR liverange optimizations for if-else structure"),
+    cl::init(true), cl::Hidden);
+
 // Enable atomic optimization
 static cl::opt<bool> EnableAtomicOptimizations(
   "amdgpu-atomic-optimizations",
@@ -193,9 +198,19 @@ static cl::opt<bool> EnableStructurizerWorkarounds(
     cl::desc("Enable workarounds for the StructurizeCFG pass"), cl::init(true),
     cl::Hidden);
 
+static cl::opt<bool> EnableLDSReplaceWithPointer(
+    "amdgpu-enable-lds-replace-with-pointer",
+    cl::desc("Enable LDS replace with pointer pass"), cl::init(false),
+    cl::Hidden);
+
 static cl::opt<bool, true> EnableLowerModuleLDS(
     "amdgpu-enable-lower-module-lds", cl::desc("Enable lower module lds pass"),
     cl::location(AMDGPUTargetMachine::EnableLowerModuleLDS), cl::init(true),
+    cl::Hidden);
+
+static cl::opt<bool> EnablePreRAOptimizations(
+    "amdgpu-enable-pre-ra-optimizations",
+    cl::desc("Enable Pre-RA optimizations pass"), cl::init(true),
     cl::Hidden);
 
 extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
@@ -220,6 +235,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSIPeepholeSDWAPass(*PR);
   initializeSIShrinkInstructionsPass(*PR);
   initializeSIOptimizeExecMaskingPreRAPass(*PR);
+  initializeSIOptimizeVGPRLiveRangePass(*PR);
   initializeSILoadStoreOptimizerPass(*PR);
   initializeAMDGPUFixFunctionBitcastsPass(*PR);
   initializeAMDGPUAlwaysInlinePass(*PR);
@@ -240,6 +256,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPULateCodeGenPreparePass(*PR);
   initializeAMDGPUPropagateAttributesEarlyPass(*PR);
   initializeAMDGPUPropagateAttributesLatePass(*PR);
+  initializeAMDGPUReplaceLDSUseWithPointerPass(*PR);
   initializeAMDGPULowerModuleLDSPass(*PR);
   initializeAMDGPURewriteOutArgumentsPass(*PR);
   initializeAMDGPUUnifyMetadataPass(*PR);
@@ -263,6 +280,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUSimplifyLibCallsPass(*PR);
   initializeAMDGPUPrintfRuntimeBindingPass(*PR);
   initializeGCNNSAReassignPass(*PR);
+  initializeGCNPreRAOptimizationsPass(*PR);
 }
 
 static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
@@ -503,6 +521,10 @@ void AMDGPUTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         }
         if (PassName == "amdgpu-always-inline") {
           PM.addPass(AMDGPUAlwaysInlinePass());
+          return true;
+        }
+        if (PassName == "amdgpu-replace-lds-use-with-pointer") {
+          PM.addPass(AMDGPUReplaceLDSUseWithPointerPass());
           return true;
         }
         if (PassName == "amdgpu-lower-module-lds") {
@@ -889,8 +911,15 @@ void AMDGPUPassConfig::addIRPasses() {
   addPass(createAMDGPUOpenCLEnqueuedBlockLoweringPass());
 
   // Can increase LDS used by kernel so runs before PromoteAlloca
-  if (EnableLowerModuleLDS)
+  if (EnableLowerModuleLDS) {
+    // The pass "amdgpu-replace-lds-use-with-pointer" need to be run before the
+    // pass "amdgpu-lower-module-lds", and also it required to be run only if
+    // "amdgpu-lower-module-lds" pass is enabled.
+    if (EnableLDSReplaceWithPointer)
+      addPass(createAMDGPUReplaceLDSUseWithPointerPass());
+
     addPass(createAMDGPULowerModuleLDSPass());
+  }
 
   if (TM.getOptLevel() > CodeGenOpt::None) {
     addPass(createInferAddressSpacesPass());
@@ -1168,11 +1197,22 @@ void GCNPassConfig::addOptimizedRegAlloc() {
   if (OptExecMaskPreRA)
     insertPass(&MachineSchedulerID, &SIOptimizeExecMaskingPreRAID);
 
+  if (EnablePreRAOptimizations.getNumOccurrences()
+          ? EnablePreRAOptimizations
+          : TM->getOptLevel() > CodeGenOpt::Less)
+    insertPass(&RenameIndependentSubregsID, &GCNPreRAOptimizationsID);
+
   // This is not an essential optimization and it has a noticeable impact on
   // compilation time, so we only enable it from O2.
   if (TM->getOptLevel() > CodeGenOpt::Less)
     insertPass(&MachineSchedulerID, &SIFormMemoryClausesID);
 
+  // FIXME: when an instruction has a Killed operand, and the instruction is
+  // inside a bundle, seems only the BUNDLE instruction appears as the Kills of
+  // the register in LiveVariables, this would trigger a failure in verifier,
+  // we should fix it and enable the verifier.
+  if (OptVGPRLiveRange)
+    insertPass(&LiveVariablesID, &SIOptimizeVGPRLiveRangeID, false);
   // This must be run immediately after phi elimination and before
   // TwoAddressInstructions, otherwise the processing of the tied operand of
   // SI_ELSE will introduce a copy of the tied operand source after the else.

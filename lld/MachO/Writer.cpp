@@ -71,14 +71,19 @@ public:
   SymtabSection *symtabSection = nullptr;
   IndirectSymtabSection *indirectSymtabSection = nullptr;
   CodeSignatureSection *codeSignatureSection = nullptr;
+  DataInCodeSection *dataInCodeSection = nullptr;
   FunctionStartsSection *functionStartsSection = nullptr;
 
   LCUuid *uuidCommand = nullptr;
   OutputSegment *linkEditSegment = nullptr;
+
+  // Output sections are added to output segments in iteration order
+  // of ConcatOutputSection, so must have deterministic iteration order.
+  MapVector<NamePair, ConcatOutputSection *> concatOutputSections;
 };
 
 // LC_DYLD_INFO_ONLY stores the offsets of symbol import/export information.
-class LCDyldInfo : public LoadCommand {
+class LCDyldInfo final : public LoadCommand {
 public:
   LCDyldInfo(RebaseSection *rebaseSection, BindingSection *bindingSection,
              WeakBindingSection *weakBindingSection,
@@ -123,7 +128,7 @@ public:
   ExportSection *exportSection;
 };
 
-class LCFunctionStarts : public LoadCommand {
+class LCFunctionStarts final : public LoadCommand {
 public:
   explicit LCFunctionStarts(FunctionStartsSection *functionStartsSection)
       : functionStartsSection(functionStartsSection) {}
@@ -142,7 +147,26 @@ private:
   FunctionStartsSection *functionStartsSection;
 };
 
-class LCDysymtab : public LoadCommand {
+class LCDataInCode final : public LoadCommand {
+public:
+  explicit LCDataInCode(DataInCodeSection *dataInCodeSection)
+      : dataInCodeSection(dataInCodeSection) {}
+
+  uint32_t getSize() const override { return sizeof(linkedit_data_command); }
+
+  void writeTo(uint8_t *buf) const override {
+    auto *c = reinterpret_cast<linkedit_data_command *>(buf);
+    c->cmd = LC_DATA_IN_CODE;
+    c->cmdsize = getSize();
+    c->dataoff = dataInCodeSection->fileOff;
+    c->datasize = dataInCodeSection->getFileSize();
+  }
+
+private:
+  DataInCodeSection *dataInCodeSection;
+};
+
+class LCDysymtab final : public LoadCommand {
 public:
   LCDysymtab(SymtabSection *symtabSection,
              IndirectSymtabSection *indirectSymtabSection)
@@ -170,7 +194,7 @@ public:
   IndirectSymtabSection *indirectSymtabSection;
 };
 
-template <class LP> class LCSegment : public LoadCommand {
+template <class LP> class LCSegment final : public LoadCommand {
 public:
   LCSegment(StringRef name, OutputSegment *seg) : name(name), seg(seg) {}
 
@@ -226,7 +250,7 @@ private:
   OutputSegment *seg;
 };
 
-class LCMain : public LoadCommand {
+class LCMain final : public LoadCommand {
   uint32_t getSize() const override {
     return sizeof(structs::entry_point_command);
   }
@@ -240,13 +264,13 @@ class LCMain : public LoadCommand {
       c->entryoff =
           in.stubs->fileOff + config->entry->stubsIndex * target->stubSize;
     else
-      c->entryoff = config->entry->getFileOffset();
+      c->entryoff = config->entry->getVA() - in.header->addr;
 
     c->stacksize = 0;
   }
 };
 
-class LCSymtab : public LoadCommand {
+class LCSymtab final : public LoadCommand {
 public:
   LCSymtab(SymtabSection *symtabSection, StringTableSection *stringTableSection)
       : symtabSection(symtabSection), stringTableSection(stringTableSection) {}
@@ -271,7 +295,7 @@ public:
 //   * LC_LOAD_DYLIB
 //   * LC_ID_DYLIB
 //   * LC_REEXPORT_DYLIB
-class LCDylib : public LoadCommand {
+class LCDylib final : public LoadCommand {
 public:
   LCDylib(LoadCommandType type, StringRef path,
           uint32_t compatibilityVersion = 0, uint32_t currentVersion = 0)
@@ -311,7 +335,7 @@ private:
 
 uint32_t LCDylib::instanceCount = 0;
 
-class LCLoadDylinker : public LoadCommand {
+class LCLoadDylinker final : public LoadCommand {
 public:
   uint32_t getSize() const override {
     return alignTo(sizeof(dylinker_command) + path.size() + 1, 8);
@@ -335,7 +359,7 @@ private:
   const StringRef path = "/usr/lib/dyld";
 };
 
-class LCRPath : public LoadCommand {
+class LCRPath final : public LoadCommand {
 public:
   explicit LCRPath(StringRef path) : path(path) {}
 
@@ -359,7 +383,7 @@ private:
   StringRef path;
 };
 
-class LCMinVersion : public LoadCommand {
+class LCMinVersion final : public LoadCommand {
 public:
   explicit LCMinVersion(const PlatformInfo &platformInfo)
       : platformInfo(platformInfo) {}
@@ -397,7 +421,7 @@ private:
   const PlatformInfo &platformInfo;
 };
 
-class LCBuildVersion : public LoadCommand {
+class LCBuildVersion final : public LoadCommand {
 public:
   explicit LCBuildVersion(const PlatformInfo &platformInfo)
       : platformInfo(platformInfo) {}
@@ -432,7 +456,7 @@ private:
 // offsets to be calculated correctly. We resolve this circular paradox by
 // first writing an LC_UUID with an all-zero UUID, then updating the UUID with
 // its real value later.
-class LCUuid : public LoadCommand {
+class LCUuid final : public LoadCommand {
 public:
   uint32_t getSize() const override { return sizeof(uuid_command); }
 
@@ -465,7 +489,7 @@ public:
   mutable uint8_t *uuidBuf;
 };
 
-template <class LP> class LCEncryptionInfo : public LoadCommand {
+template <class LP> class LCEncryptionInfo final : public LoadCommand {
 public:
   uint32_t getSize() const override {
     return sizeof(typename LP::encryption_info_command);
@@ -486,7 +510,7 @@ public:
   }
 };
 
-class LCCodeSignature : public LoadCommand {
+class LCCodeSignature final : public LoadCommand {
 public:
   LCCodeSignature(CodeSignatureSection *section) : section(section) {}
 
@@ -558,21 +582,16 @@ static void prepareSymbolRelocation(Symbol *sym, const InputSection *isec,
     // References from thread-local variable sections are treated as offsets
     // relative to the start of the referent section, and therefore have no
     // need of rebase opcodes.
-    if (!(isThreadLocalVariables(isec->flags) && isa<Defined>(sym)))
+    if (!(isThreadLocalVariables(isec->getFlags()) && isa<Defined>(sym)))
       addNonLazyBindingEntries(sym, isec, r.offset, r.addend);
   }
 }
 
 void Writer::scanRelocations() {
   TimeTraceScope timeScope("Scan relocations");
-  for (InputSection *isec : inputSections) {
+  for (ConcatInputSection *isec : inputSections) {
     if (isec->shouldOmitFromOutput())
       continue;
-
-    if (isec->segname == segment_names::ld) {
-      in.unwindInfo->prepareRelocations(isec);
-      continue;
-    }
 
     for (auto it = isec->relocs.begin(); it != isec->relocs.end(); ++it) {
       Reloc &r = *it;
@@ -590,13 +609,18 @@ void Writer::scanRelocations() {
         if (!isa<Undefined>(sym) && validateSymbolRelocation(sym, isec, r))
           prepareSymbolRelocation(sym, isec, r);
       } else {
-        assert(r.referent.is<InputSection *>());
-        assert(!r.referent.get<InputSection *>()->shouldOmitFromOutput());
+        // Canonicalize the referent so that later accesses in Writer won't
+        // have to worry about it. Perhaps we should do this for Defined::isec
+        // too...
+        auto *referentIsec = r.referent.get<InputSection *>();
+        r.referent = referentIsec->canonical();
         if (!r.pcrel)
           in.rebase->addEntry(isec, r.offset);
       }
     }
   }
+
+  in.unwindInfo->prepareRelocations();
 }
 
 void Writer::scanSymbols() {
@@ -643,6 +667,8 @@ template <class LP> void Writer::createLoadCommands() {
       make<LCDysymtab>(symtabSection, indirectSymtabSection));
   if (functionStartsSection)
     in.header->addLoadCommand(make<LCFunctionStarts>(functionStartsSection));
+  if (dataInCodeSection)
+    in.header->addLoadCommand(make<LCDataInCode>(dataInCodeSection));
   if (config->emitEncryptionInfo)
     in.header->addLoadCommand(make<LCEncryptionInfo<LP>>());
   for (StringRef path : config->runtimePaths)
@@ -712,7 +738,7 @@ template <class LP> void Writer::createLoadCommands() {
       //   command line and implicitly as a reexport from a different
       //   framework. The re-export will usually point to the tbd file
       //   in Foo.framework/Versions/A/Foo.tbd, while the explicit link will
-      //   usually find Foo.framwork/Foo.tbd. These are usually symlinks,
+      //   usually find Foo.framework/Foo.tbd. These are usually symlinks,
       //   but in a --reproduce archive they will be identical but distinct
       //   files.
       // In the first case, *semantically distinct* DylibFiles will have the
@@ -776,7 +802,8 @@ static DenseMap<const InputSection *, size_t> buildInputSectionPriorities() {
 
     SymbolPriorityEntry &entry = it->second;
     size_t &priority = sectionPriorities[sym.isec];
-    priority = std::max(priority, getSymbolPriority(entry, sym.isec->file));
+    priority =
+        std::max(priority, getSymbolPriority(entry, sym.isec->getFile()));
   };
 
   // TODO: Make sure this handles weak symbols correctly.
@@ -823,7 +850,7 @@ static void sortSegmentsAndSections() {
   }
 }
 
-static NamePair maybeRenameSection(NamePair key) {
+NamePair macho::maybeRenameSection(NamePair key) {
   auto newNames = config->sectionRenameMap.find(key);
   if (newNames != config->sectionRenameMap.end())
     return newNames->second;
@@ -841,6 +868,8 @@ template <class LP> void Writer::createOutputSections() {
   indirectSymtabSection = make<IndirectSymtabSection>();
   if (config->adhocCodesign)
     codeSignatureSection = make<CodeSignatureSection>();
+  if (config->emitDataInCodeInfo)
+    dataInCodeSection = make<DataInCodeSection>();
   if (config->emitFunctionStarts)
     functionStartsSection = make<FunctionStartsSection>();
   if (config->emitBitcodeBundle)
@@ -858,24 +887,16 @@ template <class LP> void Writer::createOutputSections() {
   }
 
   // Then add input sections to output sections.
-  DenseMap<NamePair, ConcatOutputSection *> concatOutputSections;
-  for (const auto &p : enumerate(inputSections)) {
-    InputSection *isec = p.value();
+  for (ConcatInputSection *isec : inputSections) {
     if (isec->shouldOmitFromOutput())
       continue;
-    if (auto *concatIsec = dyn_cast<ConcatInputSection>(isec)) {
-      NamePair names = maybeRenameSection({isec->segname, isec->name});
-      ConcatOutputSection *&osec = concatOutputSections[names];
-      if (osec == nullptr) {
-        osec = make<ConcatOutputSection>(names.second);
-        osec->inputOrder = p.index();
-      }
-      osec->addInput(concatIsec);
-    } else if (auto *cStringIsec = dyn_cast<CStringInputSection>(isec)) {
-      if (in.cStringSection->inputs.empty())
-        in.cStringSection->inputOrder = p.index();
-      in.cStringSection->addInput(cStringIsec);
-    }
+    NamePair names = maybeRenameSection({isec->getSegName(), isec->getName()});
+    ConcatOutputSection *&osec = concatOutputSections[names];
+    if (!osec)
+      osec = make<ConcatOutputSection>(names.second);
+    osec->addInput(isec);
+    osec->inputOrder =
+        std::min(osec->inputOrder, static_cast<int>(isec->outSecOff));
   }
 
   // Once all the inputs are added, we can finalize the output section
@@ -883,12 +904,8 @@ template <class LP> void Writer::createOutputSections() {
   for (const auto &it : concatOutputSections) {
     StringRef segname = it.first.first;
     ConcatOutputSection *osec = it.second;
-    if (segname == segment_names::ld) {
-      assert(osec->name == section_names::compactUnwind);
-      in.unwindInfo->setCompactUnwindSection(osec);
-    } else {
-      getOrCreateOutputSegment(segname)->addOutputSection(osec);
-    }
+    assert(segname != segment_names::ld);
+    getOrCreateOutputSegment(segname)->addOutputSection(osec);
   }
 
   for (SyntheticSection *ssec : syntheticSections) {
@@ -897,7 +914,8 @@ template <class LP> void Writer::createOutputSections() {
       if (it == concatOutputSections.end()) {
         getOrCreateOutputSegment(ssec->segname)->addOutputSection(ssec);
       } else {
-        fatal("section from " + toString(it->second->firstSection()->file) +
+        fatal("section from " +
+              toString(it->second->firstSection()->getFile()) +
               " conflicts with synthetic section " + ssec->segname + "," +
               ssec->name);
       }
@@ -936,8 +954,15 @@ void Writer::finalizeLinkEditSegment() {
   TimeTraceScope timeScope("Finalize __LINKEDIT segment");
   // Fill __LINKEDIT contents.
   std::vector<LinkEditSection *> linkEditSections{
-      in.rebase,  in.binding,    in.weakBinding,        in.lazyBinding,
-      in.exports, symtabSection, indirectSymtabSection, functionStartsSection,
+      in.rebase,
+      in.binding,
+      in.weakBinding,
+      in.lazyBinding,
+      in.exports,
+      symtabSection,
+      indirectSymtabSection,
+      dataInCodeSection,
+      functionStartsSection,
   };
   parallelForEach(linkEditSections, [](LinkEditSection *osec) {
     if (osec)
@@ -1049,7 +1074,13 @@ template <class LP> void macho::writeResult() { Writer().run<LP>(); }
 
 void macho::createSyntheticSections() {
   in.header = make<MachHeaderSection>();
-  in.cStringSection = config->dedupLiterals ? make<CStringSection>() : nullptr;
+  if (config->dedupLiterals) {
+    in.cStringSection = make<DeduplicatedCStringSection>();
+  } else {
+    in.cStringSection = make<CStringSection>();
+  }
+  in.wordLiteralSection =
+      config->dedupLiterals ? make<WordLiteralSection>() : nullptr;
   in.rebase = make<RebaseSection>();
   in.binding = make<BindingSection>();
   in.weakBinding = make<WeakBindingSection>();
@@ -1060,8 +1091,19 @@ void macho::createSyntheticSections() {
   in.lazyPointers = make<LazyPointerSection>();
   in.stubs = make<StubsSection>();
   in.stubHelper = make<StubHelperSection>();
-  in.imageLoaderCache = make<ImageLoaderCacheSection>();
   in.unwindInfo = makeUnwindInfoSection();
+
+  // This section contains space for just a single word, and will be used by
+  // dyld to cache an address to the image loader it uses.
+  uint8_t *arr = bAlloc.Allocate<uint8_t>(target->wordSize);
+  memset(arr, 0, target->wordSize);
+  in.imageLoaderCache = make<ConcatInputSection>(
+      segment_names::data, section_names::data, /*file=*/nullptr,
+      ArrayRef<uint8_t>{arr, target->wordSize},
+      /*align=*/target->wordSize, /*flags=*/S_REGULAR);
+  // References from dyld are not visible to us, so ensure this section is
+  // always treated as live.
+  in.imageLoaderCache->live = true;
 }
 
 OutputSection *macho::firstTLVDataSection = nullptr;

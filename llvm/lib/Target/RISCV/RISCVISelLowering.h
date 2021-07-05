@@ -552,6 +552,7 @@ private:
   SDValue lowerFixedLengthVectorLogicOpToRVV(SDValue Op, SelectionDAG &DAG,
                                              unsigned MaskOpc,
                                              unsigned VecOpc) const;
+  SDValue lowerFixedLengthVectorShiftToRVV(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerFixedLengthVectorSelectToRVV(SDValue Op,
                                             SelectionDAG &DAG) const;
   SDValue lowerToScalableOp(SDValue Op, SelectionDAG &DAG, unsigned NewOpc,
@@ -561,6 +562,9 @@ private:
                                             unsigned ExtendOpc) const;
   SDValue lowerGET_ROUNDING(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerSET_ROUNDING(SDValue Op, SelectionDAG &DAG) const;
+
+  SDValue expandUnalignedRVVLoad(SDValue Op, SelectionDAG &DAG) const;
+  SDValue expandUnalignedRVVStore(SDValue Op, SelectionDAG &DAG) const;
 
   bool isEligibleForTailCallOptimization(
       CCState &CCInfo, CallLoweringInfo &CLI, MachineFunction &MF,

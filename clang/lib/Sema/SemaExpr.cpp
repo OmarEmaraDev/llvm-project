@@ -47,8 +47,10 @@
 #include "clang/Sema/SemaInternal.h"
 #include "clang/Sema/Template.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/SaveAndRestore.h"
+
 using namespace clang;
 using namespace sema;
 using llvm::RoundingMode;
@@ -3671,7 +3673,7 @@ bool Sema::CheckLoopHintExpr(Expr *E, SourceLocation Loc) {
   bool ValueIsPositive = ValueAPS.isStrictlyPositive();
   if (!ValueIsPositive || ValueAPS.getActiveBits() > 31) {
     Diag(E->getExprLoc(), diag::err_pragma_loop_invalid_argument_value)
-        << ValueAPS.toString(10) << ValueIsPositive;
+        << toString(ValueAPS, 10) << ValueIsPositive;
     return true;
   }
 
@@ -4052,6 +4054,10 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
 
 ExprResult Sema::ActOnParenExpr(SourceLocation L, SourceLocation R, Expr *E) {
   assert(E && "ActOnParenExpr() missing expr");
+  QualType ExprTy = E->getType();
+  if (getLangOpts().ProtectParens && CurFPFeatures.getAllowFPReassociate() &&
+      !E->isLValue() && ExprTy->hasFloatingRepresentation())
+    return BuildBuiltinCallExpr(R, Builtin::BI__arithmetic_fence, E);
   return new (Context) ParenExpr(L, R, E);
 }
 
@@ -5058,7 +5064,7 @@ ExprResult Sema::ActOnOMPArraySectionExpr(Expr *Base, SourceLocation LBLoc,
       llvm::APSInt LengthValue = Result.Val.getInt();
       if (LengthValue.isNegative()) {
         Diag(Length->getExprLoc(), diag::err_omp_section_length_negative)
-            << LengthValue.toString(/*Radix=*/10, /*Signed=*/true)
+            << toString(LengthValue, /*Radix=*/10, /*Signed=*/true)
             << Length->getSourceRange();
         return ExprError();
       }
@@ -5082,7 +5088,7 @@ ExprResult Sema::ActOnOMPArraySectionExpr(Expr *Base, SourceLocation LBLoc,
       llvm::APSInt StrideValue = Result.Val.getInt();
       if (!StrideValue.isStrictlyPositive()) {
         Diag(Stride->getExprLoc(), diag::err_omp_section_stride_non_positive)
-            << StrideValue.toString(/*Radix=*/10, /*Signed=*/true)
+            << toString(StrideValue, /*Radix=*/10, /*Signed=*/true)
             << Stride->getSourceRange();
         return ExprError();
       }
@@ -5161,7 +5167,7 @@ ExprResult Sema::ActOnOMPArrayShapingExpr(Expr *Base, SourceLocation LParenLoc,
         llvm::APSInt Value = EvResult.Val.getInt();
         if (!Value.isStrictlyPositive()) {
           Diag(Dim->getExprLoc(), diag::err_omp_shaping_dimension_not_positive)
-              << Value.toString(/*Radix=*/10, /*Signed=*/true)
+              << toString(Value, /*Radix=*/10, /*Signed=*/true)
               << Dim->getSourceRange();
           ErrorFound = true;
           continue;
@@ -5922,6 +5928,7 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
   for (unsigned i = 0; i < TotalNumArgs; ++i)
     Call->setArg(i, AllArgs[i]);
 
+  Call->computeDependence();
   return false;
 }
 
@@ -6558,6 +6565,29 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                                ExecConfig, IsExecConfig);
 }
 
+/// BuildBuiltinCallExpr - Create a call to a builtin function specified by Id
+//  with the specified CallArgs
+Expr *Sema::BuildBuiltinCallExpr(SourceLocation Loc, Builtin::ID Id,
+                                 MultiExprArg CallArgs) {
+  StringRef Name = Context.BuiltinInfo.getName(Id);
+  LookupResult R(*this, &Context.Idents.get(Name), Loc,
+                 Sema::LookupOrdinaryName);
+  LookupName(R, TUScope, /*AllowBuiltinCreation=*/true);
+
+  auto *BuiltInDecl = R.getAsSingle<FunctionDecl>();
+  assert(BuiltInDecl && "failed to find builtin declaration");
+
+  ExprResult DeclRef =
+      BuildDeclRefExpr(BuiltInDecl, BuiltInDecl->getType(), VK_LValue, Loc);
+  assert(DeclRef.isUsable() && "Builtin reference cannot fail");
+
+  ExprResult Call =
+      BuildCallExpr(/*Scope=*/nullptr, DeclRef.get(), Loc, CallArgs, Loc);
+
+  assert(!Call.isInvalid() && "Call to builtin cannot fail!");
+  return Call.get();
+}
+
 /// Parse a __builtin_astype expression.
 ///
 /// __builtin_astype( value, dst type )
@@ -6834,6 +6864,7 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
 
       TheCall->setArg(i, Arg);
     }
+    TheCall->computeDependence();
   }
 
   if (CXXMethodDecl *Method = dyn_cast_or_null<CXXMethodDecl>(FDecl))
@@ -11800,6 +11831,21 @@ QualType Sema::CheckCompareOperands(ExprResult &LHS, ExprResult &RHS,
                                    LHS.get()->getSourceRange());
   }
 
+  if (IsOrdered && LHSType->isFunctionPointerType() &&
+      RHSType->isFunctionPointerType()) {
+    // Valid unless a relational comparison of function pointers
+    bool IsError = Opc == BO_Cmp;
+    auto DiagID =
+        IsError ? diag::err_typecheck_ordered_comparison_of_function_pointers
+        : getLangOpts().CPlusPlus
+            ? diag::warn_typecheck_ordered_comparison_of_function_pointers
+            : diag::ext_typecheck_ordered_comparison_of_function_pointers;
+    Diag(Loc, DiagID) << LHSType << RHSType << LHS.get()->getSourceRange()
+                      << RHS.get()->getSourceRange();
+    if (IsError)
+      return QualType();
+  }
+
   if ((LHSType->isIntegerType() && !LHSIsNull) ||
       (RHSType->isIntegerType() && !RHSIsNull)) {
     // Skip normal pointer conversion checks in this case; we have better
@@ -11866,12 +11912,6 @@ QualType Sema::CheckCompareOperands(ExprResult &LHS, ExprResult &RHS,
               << LHS.get()->getSourceRange() << RHS.get()->getSourceRange()
               << LHSType << RHSType << LCanPointeeTy->isIncompleteType()
               << RCanPointeeTy->isIncompleteType();
-        }
-        if (LCanPointeeTy->isFunctionType()) {
-          // Valid unless a relational comparison of function pointers
-          Diag(Loc, diag::ext_typecheck_ordered_comparison_of_function_pointers)
-              << LHSType << RHSType << LHS.get()->getSourceRange()
-              << RHS.get()->getSourceRange();
         }
       }
     } else if (!IsRelational &&
@@ -12213,11 +12253,30 @@ QualType Sema::CheckVectorCompareOperands(ExprResult &LHS, ExprResult &RHS,
 
   QualType LHSType = LHS.get()->getType();
 
-  // If AltiVec, the comparison results in a numeric type, i.e.
-  // bool for C++, int for C
-  if (getLangOpts().AltiVec &&
-      vType->castAs<VectorType>()->getVectorKind() == VectorType::AltiVecVector)
-    return Context.getLogicalOperationType();
+  // Determine the return type of a vector compare. By default clang will return
+  // a scalar for all vector compares except vector bool and vector pixel.
+  // With the gcc compiler we will always return a vector type and with the xl
+  // compiler we will always return a scalar type. This switch allows choosing
+  // which behavior is prefered.
+  if (getLangOpts().AltiVec) {
+    switch (getLangOpts().getAltivecSrcCompat()) {
+    case LangOptions::AltivecSrcCompatKind::Mixed:
+      // If AltiVec, the comparison results in a numeric type, i.e.
+      // bool for C++, int for C
+      if (vType->castAs<VectorType>()->getVectorKind() ==
+          VectorType::AltiVecVector)
+        return Context.getLogicalOperationType();
+      else
+        Diag(Loc, diag::warn_deprecated_altivec_src_compat);
+      break;
+    case LangOptions::AltivecSrcCompatKind::GCC:
+      // For GCC we always return the vector type.
+      break;
+    case LangOptions::AltivecSrcCompatKind::XL:
+      return Context.getLogicalOperationType();
+      break;
+    }
+  }
 
   // For non-floating point types, check for self-comparisons of the form
   // x == x, x != x, x < x, etc.  These always evaluate to a constant, and
@@ -12319,7 +12378,8 @@ static void diagnoseXorMisusedAsPow(Sema &S, const ExprResult &XorLHS,
       RHSStrRef.find('\'') != StringRef::npos)
     return;
 
-  bool SuggestXor = S.getLangOpts().CPlusPlus || S.getPreprocessor().isMacroDefined("xor");
+  bool SuggestXor =
+      S.getLangOpts().CPlusPlus || S.getPreprocessor().isMacroDefined("xor");
   const llvm::APInt XorValue = LeftSideValue ^ RightSideValue;
   int64_t RightSideIntValue = RightSideValue.getSExtValue();
   if (LeftSideValue == 2 && RightSideIntValue >= 0) {
@@ -12330,27 +12390,30 @@ static void diagnoseXorMisusedAsPow(Sema &S, const ExprResult &XorLHS,
     if (Overflow) {
       if (RightSideIntValue < 64)
         S.Diag(Loc, diag::warn_xor_used_as_pow_base)
-            << ExprStr << XorValue.toString(10, true) << ("1LL << " + RHSStr)
+            << ExprStr << toString(XorValue, 10, true) << ("1LL << " + RHSStr)
             << FixItHint::CreateReplacement(ExprRange, "1LL << " + RHSStr);
       else if (RightSideIntValue == 64)
-        S.Diag(Loc, diag::warn_xor_used_as_pow) << ExprStr << XorValue.toString(10, true);
+        S.Diag(Loc, diag::warn_xor_used_as_pow)
+            << ExprStr << toString(XorValue, 10, true);
       else
         return;
     } else {
       S.Diag(Loc, diag::warn_xor_used_as_pow_base_extra)
-          << ExprStr << XorValue.toString(10, true) << SuggestedExpr
-          << PowValue.toString(10, true)
+          << ExprStr << toString(XorValue, 10, true) << SuggestedExpr
+          << toString(PowValue, 10, true)
           << FixItHint::CreateReplacement(
                  ExprRange, (RightSideIntValue == 0) ? "1" : SuggestedExpr);
     }
 
-    S.Diag(Loc, diag::note_xor_used_as_pow_silence) << ("0x2 ^ " + RHSStr) << SuggestXor;
+    S.Diag(Loc, diag::note_xor_used_as_pow_silence)
+        << ("0x2 ^ " + RHSStr) << SuggestXor;
   } else if (LeftSideValue == 10) {
     std::string SuggestedValue = "1e" + std::to_string(RightSideIntValue);
     S.Diag(Loc, diag::warn_xor_used_as_pow_base)
-        << ExprStr << XorValue.toString(10, true) << SuggestedValue
+        << ExprStr << toString(XorValue, 10, true) << SuggestedValue
         << FixItHint::CreateReplacement(ExprRange, SuggestedValue);
-    S.Diag(Loc, diag::note_xor_used_as_pow_silence) << ("0xA ^ " + RHSStr) << SuggestXor;
+    S.Diag(Loc, diag::note_xor_used_as_pow_silence)
+        << ("0xA ^ " + RHSStr) << SuggestXor;
   }
 }
 
@@ -16707,8 +16770,10 @@ void Sema::PopExpressionEvaluationContext() {
 
   if (!Rec.Lambdas.empty()) {
     using ExpressionKind = ExpressionEvaluationContextRecord::ExpressionKind;
-    if (Rec.ExprContext == ExpressionKind::EK_TemplateArgument || Rec.isUnevaluated() ||
-        (Rec.isConstantEvaluated() && !getLangOpts().CPlusPlus17)) {
+    if (!getLangOpts().CPlusPlus20 &&
+        (Rec.ExprContext == ExpressionKind::EK_TemplateArgument ||
+         Rec.isUnevaluated() ||
+         (Rec.isConstantEvaluated() && !getLangOpts().CPlusPlus17))) {
       unsigned D;
       if (Rec.isUnevaluated()) {
         // C++11 [expr.prim.lambda]p2:
